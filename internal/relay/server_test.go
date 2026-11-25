@@ -534,13 +534,35 @@ func TestCreateWithAuthFlagRejected(t *testing.T) {
 	}
 }
 
-func TestJoinRejectsUnencodableRoster(t *testing.T) {
+func TestJoinFitsMaximumRoster(t *testing.T) {
 	server, _ := newTestServer(t)
-	longName := strings.Repeat("🤝", 18)
+	longName := strings.Repeat("🤝", 19)
 	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
 		RequestID: "00000001", Name: longName,
 	}, addr(1)).welcome
-	for index := 2; index <= 7; index++ {
+	for index := 2; index <= 8; index++ {
+		join := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+			RequestID: fmt.Sprintf("%08x", index), Name: longName, RoomCode: host.RoomCode,
+		}, addr(index))
+		if join.welcome == nil {
+			t.Fatalf("member %d did not fit: %+v", index, join.errMsg)
+		}
+		if len(join.raw) > protocol.MaxOuterDatagram {
+			t.Fatalf("member %d welcome is %d bytes", index, len(join.raw))
+		}
+		if index == 8 && (join.welcome.MemberID != 9 || len(join.welcome.Members) != 8) {
+			t.Fatalf("unexpected full roster: %+v", join.welcome)
+		}
+	}
+}
+
+func TestJoinRejectsUnencodableRoster(t *testing.T) {
+	server, _ := newTestServer(t)
+	longName := strings.Repeat("🤝", 24)
+	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "00000001", Name: longName,
+	}, addr(1)).welcome
+	for index := 2; index <= 6; index++ {
 		join := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
 			RequestID: fmt.Sprintf("%08x", index), Name: longName, RoomCode: host.RoomCode,
 		}, addr(index))
@@ -549,15 +571,15 @@ func TestJoinRejectsUnencodableRoster(t *testing.T) {
 		}
 	}
 	overflow := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
-		RequestID: "00000008", Name: longName, RoomCode: host.RoomCode,
-	}, addr(8))
+		RequestID: "00000007", Name: longName, RoomCode: host.RoomCode,
+	}, addr(7))
 	if overflow.errMsg == nil || overflow.errMsg.Code != "roster_too_large" {
 		t.Fatalf("expected roster error, got %+v", overflow)
 	}
 	guest := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
-		RequestID: "00000009", Name: "guest", RoomCode: host.RoomCode,
-	}, addr(8)).welcome
-	if guest == nil || guest.MemberID != 9 || len(guest.Members) != 8 {
+		RequestID: "00000008", Name: "guest", RoomCode: host.RoomCode,
+	}, addr(7)).welcome
+	if guest == nil || guest.MemberID != 8 || len(guest.Members) != 7 {
 		t.Fatalf("failed join affected the roster: %+v", guest)
 	}
 }

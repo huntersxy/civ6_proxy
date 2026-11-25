@@ -43,8 +43,8 @@ func TestDecodeRejectsPreviousProtocolVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy(raw[:4], "C6R1")
-	raw[4] = 1
+	copy(raw[:4], "C6R2")
+	raw[4] = 2
 	if _, err := Decode(raw); !errors.Is(err, ErrMagic) {
 		t.Fatalf("previous protocol magic returned %v", err)
 	}
@@ -199,6 +199,43 @@ func TestSplitPayload(t *testing.T) {
 	}
 	if len(chunks) != 3 || len(chunks[0]) != MaxFragmentPayload || len(chunks[2]) != 5 {
 		t.Fatalf("unexpected split sizes: %d", len(chunks))
+	}
+}
+
+func TestCiv6LargeDatagramFitsSingleFrame(t *testing.T) {
+	payload := make([]byte, 1180)
+	chunks, err := SplitPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || len(chunks[0]) != len(payload) {
+		t.Fatalf("1180-byte datagram split into %d chunks", len(chunks))
+	}
+	raw, err := (&Frame{
+		Kind: KindData, FragmentCount: 1, SourcePort: 62056, TargetPort: 62056,
+		Payload: chunks[0],
+	}).Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != HeaderSize+len(payload)+AuthTagSize || len(raw) > MaxOuterDatagram {
+		t.Fatalf("single-frame size=%d, limit=%d", len(raw), MaxOuterDatagram)
+	}
+	decoded, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Payload) != len(payload) || decoded.FragmentCount != 1 {
+		t.Fatalf("decoded large datagram: frames=%d bytes=%d", decoded.FragmentCount, len(decoded.Payload))
+	}
+}
+
+func TestFragmentPayloadBoundary(t *testing.T) {
+	if got, err := SplitPayload(make([]byte, MaxFragmentPayload)); err != nil || len(got) != 1 {
+		t.Fatalf("boundary payload: chunks=%d err=%v", len(got), err)
+	}
+	if got, err := SplitPayload(make([]byte, MaxFragmentPayload+1)); err != nil || len(got) != 2 {
+		t.Fatalf("payload over boundary: chunks=%d err=%v", len(got), err)
 	}
 }
 

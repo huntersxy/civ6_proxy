@@ -1,4 +1,4 @@
-// Package relay implements the in-memory room server for Civ6Relay v2.
+// Package relay implements the in-memory room server for Civ6Relay v3.
 package relay
 
 import (

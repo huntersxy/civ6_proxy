@@ -1,4 +1,4 @@
-// Package protocol implements the Civ6Relay v2 UDP wire format.
+// Package protocol implements the Civ6Relay v3 UDP wire format.
 package protocol
 
 import (
@@ -16,11 +16,11 @@ import (
 )
 
 const (
-	Magic              = "C6R2"
-	Version            = 2
+	Magic              = "C6R3"
+	Version            = 3
 	HeaderSize         = 40
 	AuthTagSize        = 16
-	MaxOuterDatagram   = 1200
+	MaxOuterDatagram   = 1280 // 1224-byte payload; Civ 6's common 1180-byte datagrams fit one frame.
 	MaxUDPPayload      = 65507
 	MaxFragmentPayload = MaxOuterDatagram - HeaderSize - AuthTagSize
 	MaxFragmentCount   = (MaxUDPPayload + MaxFragmentPayload - 1) / MaxFragmentPayload

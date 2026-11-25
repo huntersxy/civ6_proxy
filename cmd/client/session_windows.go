@@ -404,11 +404,11 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		s.mu.Unlock()
 		s.notify()
 		var route win.RouteInfo
-		route, err = win.RouteTo(client.RelayAddr().IP)
+		subnet, err = win.SelectVirtualSubnet(client.RelayAddr().IP)
 		if err != nil {
 			return err
 		}
-		subnet, err = win.SelectVirtualSubnet(client.RelayAddr().IP)
+		route, err = win.RouteTo(win.VirtualMemberIP(subnet, 2))
 		if err != nil {
 			return err
 		}
