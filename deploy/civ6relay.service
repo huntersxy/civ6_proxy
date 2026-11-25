@@ -1,5 +1,6 @@
 [Unit]
-Description=Civ 6 UDP relay
+Description=Civ6Relay UDP room relay
+Documentation=https://github.com/Dts0/civ6_proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -7,15 +8,18 @@ Wants=network-online.target
 Type=simple
 User=civ6relay
 Group=civ6relay
-WorkingDirectory=/opt/civ6relay
-ExecStart=/opt/civ6relay/.venv/bin/python -m civ6relay.server --listen 0.0.0.0:42056 --log-level INFO
-Restart=on-failure
+ExecStart=/usr/local/bin/civ6relay-server -listen 0.0.0.0:42056
+Restart=always
 RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-
