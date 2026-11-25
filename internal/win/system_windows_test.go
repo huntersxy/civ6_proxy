@@ -7,7 +7,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"unsafe"
+
+	"civ6relay/internal/packet"
 )
 
 func TestRouteAndSubnet(t *testing.T) {
@@ -63,6 +67,48 @@ func TestDriverExtractAndLoad(t *testing.T) {
 	if _, err := loadDivertAPI(dll); err != nil {
 		t.Fatalf("missing exports: %v", err)
 	}
+	t.Run("bridge filters", func(t *testing.T) {
+		eval, err := dll.FindProc("WinDivertHelperEvalFilter")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, subnet, err := net.ParseCIDR("10.250.250.0/24")
+		if err != nil {
+			t.Fatal(err)
+		}
+		game, discovery := bridgeFilters(subnet)
+		for _, test := range []struct {
+			target    net.IP
+			port      uint16
+			game      bool
+			discovery bool
+		}{
+			{VirtualMemberIP(subnet, 2), 62056, true, false},
+			{VirtualMemberIP(subnet, 9), 62056, true, false},
+			{VirtualMemberIP(subnet, 10), 62056, false, false},
+			{net.IPv4bcast, 62900, false, true},
+			{net.IPv4bcast, 62999, false, true},
+			{net.IPv4bcast, 62056, false, false},
+		} {
+			raw, err := packet.BuildIPv4UDP(net.IPv4(10, 0, 0, 1), test.target, 62056, test.port, nil, 128, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := wdAddress{Bits: 1 << 17}
+			matches := func(filter string) bool {
+				expr, err := syscall.BytePtrFromString(filter)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, _, _ := eval.Call(uintptr(unsafe.Pointer(expr)), uintptr(unsafe.Pointer(&raw[0])),
+					uintptr(len(raw)), uintptr(unsafe.Pointer(&address)))
+				return result != 0
+			}
+			if matches(game) != test.game || matches(discovery) != test.discovery {
+				t.Errorf("unexpected capture rule for %s:%d", test.target, test.port)
+			}
+		}
+	})
 }
 
 func TestListProcesses(t *testing.T) {

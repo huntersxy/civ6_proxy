@@ -22,9 +22,6 @@ func newTokenBucket(packetRate, byteRate, burst float64) tokenBucket {
 }
 
 func (b *tokenBucket) allow(size int, now float64) bool {
-	if b.updated == 0 {
-		b.updated = now
-	}
 	elapsed := now - b.updated
 	if elapsed < 0 {
 		elapsed = 0

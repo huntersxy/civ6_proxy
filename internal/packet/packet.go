@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 )
 
 const (
 	ipv4HeaderLen = 20
 	udpHeaderLen  = 8
+	MaxIPv4Size   = 65535
 )
 
 // Datagram is a parsed IPv4/UDP packet.
@@ -25,6 +27,10 @@ type Datagram struct {
 
 // InternetChecksum computes the standard 16-bit one's complement checksum.
 func InternetChecksum(data []byte) uint16 {
+	return finishChecksum(checksumWords(data))
+}
+
+func checksumWords(data []byte) uint32 {
 	var sum uint32
 	for len(data) >= 2 {
 		sum += uint32(data[0])<<8 | uint32(data[1])
@@ -33,6 +39,10 @@ func InternetChecksum(data []byte) uint16 {
 	if len(data) == 1 {
 		sum += uint32(data[0]) << 8
 	}
+	return sum
+}
+
+func finishChecksum(sum uint32) uint16 {
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)
 	}
@@ -41,16 +51,23 @@ func InternetChecksum(data []byte) uint16 {
 
 // BuildIPv4UDP synthesizes a complete IPv4/UDP packet with checksums.
 func BuildIPv4UDP(sourceIP, targetIP net.IP, sourcePort, targetPort uint16, payload []byte, ttl uint8, identification uint16) ([]byte, error) {
+	return AppendIPv4UDP(nil, sourceIP, targetIP, sourcePort, targetPort, payload, ttl, identification)
+}
+
+// AppendIPv4UDP appends a checksummed IPv4/UDP packet to dst.
+func AppendIPv4UDP(buffer []byte, sourceIP, targetIP net.IP, sourcePort, targetPort uint16, payload []byte, ttl uint8, identification uint16) ([]byte, error) {
 	src := sourceIP.To4()
 	dst := targetIP.To4()
 	if src == nil || dst == nil {
 		return nil, errors.New("IPv4 address required")
 	}
-	if len(payload) > 65507 {
+	if len(payload) > MaxIPv4Size-ipv4HeaderLen-udpHeaderLen {
 		return nil, errors.New("UDP payload too large")
 	}
 	totalLen := ipv4HeaderLen + udpHeaderLen + len(payload)
-	out := make([]byte, totalLen)
+	offset := len(buffer)
+	buffer = slices.Grow(buffer, totalLen)[:offset+totalLen]
+	out := buffer[offset:]
 	h := out[:ipv4HeaderLen]
 	h[0] = 0x45
 	h[1] = 0
@@ -72,21 +89,16 @@ func BuildIPv4UDP(sourceIP, targetIP net.IP, sourcePort, targetPort uint16, payl
 	binary.BigEndian.PutUint16(u[6:8], 0)
 	copy(out[ipv4HeaderLen+udpHeaderLen:], payload)
 
-	// Pseudo header: source, destination, zero, protocol, UDP length.
-	var pseudo [12]byte
-	copy(pseudo[0:4], src)
-	copy(pseudo[4:8], dst)
-	pseudo[9] = 17
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(udpLen))
-	checksum := InternetChecksum(append(pseudo[:], out[ipv4HeaderLen:]...))
+	pseudoSum := checksumWords(h[12:20]) + uint32(h[9]) + uint32(udpLen)
+	checksum := finishChecksum(pseudoSum + checksumWords(out[ipv4HeaderLen:]))
 	if checksum == 0 {
 		checksum = 0xffff
 	}
 	binary.BigEndian.PutUint16(u[6:8], checksum)
-	return out, nil
+	return buffer, nil
 }
 
-// ParseIPv4UDP extracts the UDP view of an IPv4 packet.
+// ParseIPv4UDP returns addresses and payload backed by raw.
 func ParseIPv4UDP(raw []byte) (Datagram, error) {
 	var d Datagram
 	if len(raw) < ipv4HeaderLen+udpHeaderLen {
@@ -106,15 +118,18 @@ func ParseIPv4UDP(raw []byte) (Datagram, error) {
 	if raw[9] != 17 {
 		return d, errors.New("not UDP")
 	}
+	if binary.BigEndian.Uint16(raw[6:8])&0x3fff != 0 {
+		return d, errors.New("fragmented IPv4 packet")
+	}
 	udpLen := int(binary.BigEndian.Uint16(raw[ihl+4 : ihl+6]))
 	if udpLen < udpHeaderLen || ihl+udpLen > totalLen {
 		return d, errors.New("invalid UDP length")
 	}
-	d.SourceIP = net.IPv4(raw[12], raw[13], raw[14], raw[15])
-	d.TargetIP = net.IPv4(raw[16], raw[17], raw[18], raw[19])
+	d.SourceIP = net.IP(raw[12:16:16])
+	d.TargetIP = net.IP(raw[16:20:20])
 	d.SourcePort = binary.BigEndian.Uint16(raw[ihl : ihl+2])
 	d.TargetPort = binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
-	d.Payload = raw[ihl+udpHeaderLen : ihl+udpLen]
+	d.Payload = raw[ihl+udpHeaderLen : ihl+udpLen : ihl+udpLen]
 	return d, nil
 }
 

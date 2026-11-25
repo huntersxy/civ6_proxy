@@ -1,16 +1,25 @@
 package tunnel
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"testing"
 	"time"
 
+	"civ6relay/internal/protocol"
 	"civ6relay/internal/relay"
 )
 
 func startTestRelay(t *testing.T) (host string, port int, stop func()) {
+	t.Helper()
+	return startFilteredTestRelay(t, nil)
+}
+
+func startFilteredTestRelay(t *testing.T, filter func([]byte) bool) (host string, port int, stop func()) {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -20,13 +29,18 @@ func startTestRelay(t *testing.T) (host string, port int, stop func()) {
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 2048)
+		var batch relay.Batch
 		for {
-			n, peer, err := conn.ReadFromUDP(buf)
+			n, peer, err := conn.ReadFromUDPAddrPort(buf)
 			if err != nil {
 				return
 			}
-			for _, out := range srv.Handle(buf[:n], peer) {
-				_, _ = conn.WriteToUDP(out.Data, out.Addr)
+			if filter != nil && !filter(buf[:n]) {
+				continue
+			}
+			srv.HandleInto(buf[:n], peer, &batch)
+			for _, out := range batch.Datagrams {
+				_, _ = conn.WriteToUDPAddrPort(out.Data, out.Addr)
 			}
 		}
 	}()
@@ -39,7 +53,7 @@ func startTestRelay(t *testing.T) (host string, port int, stop func()) {
 				return
 			case <-ticker.C:
 				for _, out := range srv.Cleanup() {
-					_, _ = conn.WriteToUDP(out.Data, out.Addr)
+					_, _ = conn.WriteToUDPAddrPort(out.Data, out.Addr)
 				}
 			}
 		}
@@ -75,7 +89,7 @@ func TestTunnelEndToEnd(t *testing.T) {
 	defer host.Disconnect()
 	hostData := make(chan []byte, 16)
 	host.SetDataHandler(func(src uint8, sport, dport uint16, payload []byte) {
-		hostData <- append([]byte(nil), payload...)
+		hostData <- payload
 	})
 	welcomeHost, err := host.CreateRoom("host", 3*time.Second)
 	if err != nil {
@@ -92,7 +106,7 @@ func TestTunnelEndToEnd(t *testing.T) {
 	defer guest.Disconnect()
 	guestData := make(chan []byte, 16)
 	guest.SetDataHandler(func(src uint8, sport, dport uint16, payload []byte) {
-		guestData <- append([]byte(nil), payload...)
+		guestData <- payload
 	})
 	events := make(chan Event, 16)
 	guest.SetEventHandler(func(ev Event) { events <- ev })
@@ -106,6 +120,7 @@ func TestTunnelEndToEnd(t *testing.T) {
 	}
 
 	waitFor(t, "host peer update", func() bool { return len(host.Peers()) == 2 })
+	waitFor(t, "first RTT probe", func() bool { return host.Metrics().HasRTT && guest.Metrics().HasRTT })
 
 	// Guest -> host unicast.
 	if !guest.SendGameData(2, 62056, 62900, []byte("hello-host"), false) {
@@ -133,6 +148,22 @@ func TestTunnelEndToEnd(t *testing.T) {
 		t.Fatal("guest did not receive broadcast")
 	}
 
+	largePayload := make([]byte, protocol.MaxUDPPayload)
+	for index := range largePayload {
+		largePayload[index] = byte(index % 251)
+	}
+	if !guest.SendGameData(2, 62056, 62056, largePayload, false) {
+		t.Fatal("fragmented send failed")
+	}
+	select {
+	case payload := <-hostData:
+		if !bytes.Equal(payload, largePayload) {
+			t.Fatalf("reassembled payload differed (%d vs %d bytes)", len(payload), len(largePayload))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("host did not receive fragmented data")
+	}
+
 	// Host leave -> guest gets ROOM_CLOSED.
 	host.Disconnect()
 	deadline := time.After(3 * time.Second)
@@ -148,5 +179,59 @@ func TestTunnelEndToEnd(t *testing.T) {
 		case <-deadline:
 			t.Fatal("guest did not receive ROOM_CLOSED")
 		}
+	}
+}
+
+func TestCancelledHandshakeIgnoresWelcome(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	client, err := New("127.0.0.1", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Disconnect()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.CreateRoomContext(ctx, "host")
+		result <- err
+	}()
+
+	buf := make([]byte, protocol.MaxOuterDatagram)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	count, source, err := conn.ReadFromUDPAddrPort(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := relay.New(relay.Config{Logger: log.New(io.Discard, "", 0)})
+	var batch relay.Batch
+	server.HandleInto(buf[:count], source, &batch)
+	if len(batch.Datagrams) != 1 {
+		t.Fatal("expected a welcome reply")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v instead of cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not cancel the request")
+	}
+
+	raw := batch.Datagrams[0].Data
+	welcome, err := protocol.DecodeView(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handleHandshakeResponse(&welcome)
+	if client.Connected() {
+		t.Fatal("cancelled request installed room credentials")
 	}
 }

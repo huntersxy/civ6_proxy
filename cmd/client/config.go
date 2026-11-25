@@ -19,10 +19,13 @@ const defaultRelayPort = 42056
 // Config mirrors the Python client's config file so existing settings carry
 // over unchanged.
 type Config struct {
-	RelayHost   string `json:"relay_host"`
-	RelayPort   int    `json:"relay_port"`
-	DisplayName string `json:"display_name"`
+	RelayHost    string   `json:"relay_host"`
+	RelayPort    int      `json:"relay_port"`
+	DisplayName  string   `json:"display_name"`
+	RelayHistory []string `json:"relay_history,omitempty"`
 }
+
+const maxRelayHistory = 20
 
 func configPath() string {
 	base := os.Getenv("APPDATA")
@@ -53,7 +56,50 @@ func loadConfig() Config {
 	if name, err := protocol.NormalizeName(stored.DisplayName); err == nil {
 		cfg.DisplayName = name
 	}
+	cfg.RelayHistory = normalizeRelayHistory(stored.RelayHistory)
 	return cfg
+}
+
+func normalizeRelayHistory(addresses []string) []string {
+	var history []string
+	seen := make(map[string]struct{}, min(len(addresses), maxRelayHistory))
+	for _, address := range addresses {
+		host, port, err := parseRelayAddress(address)
+		if err != nil {
+			continue
+		}
+		canonical := net.JoinHostPort(strings.ToLower(host), strconv.Itoa(port))
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		history = append(history, canonical)
+		if len(history) == maxRelayHistory {
+			break
+		}
+	}
+	return history
+}
+
+func addRelayHistory(addresses []string, address string) []string {
+	host, port, err := parseRelayAddress(address)
+	if err != nil {
+		return normalizeRelayHistory(addresses)
+	}
+	canonical := net.JoinHostPort(strings.ToLower(host), strconv.Itoa(port))
+	history := normalizeRelayHistory(addresses)
+	out := make([]string, 0, min(len(history)+1, maxRelayHistory))
+	out = append(out, canonical)
+	for _, existing := range history {
+		if existing == canonical {
+			continue
+		}
+		out = append(out, existing)
+		if len(out) == maxRelayHistory {
+			break
+		}
+	}
+	return out
 }
 
 func saveConfig(cfg Config) error {
@@ -65,11 +111,24 @@ func saveConfig(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	return writeClientFile(path, data)
+}
+
+func writeClientFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".civ6relay-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(tmp.Name())
+	_, writeErr := tmp.Write(data)
+	closeErr := tmp.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func defaultName() string {
@@ -100,6 +159,9 @@ func parseRelayAddress(value string) (string, int, error) {
 		host = strings.TrimSpace(host)
 		if host == "" {
 			return "", 0, fmt.Errorf("中转主机不能为空")
+		}
+		if strings.Contains(host, ":") {
+			return "", 0, fmt.Errorf("中转服务器需要 IPv4 地址或域名")
 		}
 		port, err := strconv.Atoi(portText)
 		if err != nil {

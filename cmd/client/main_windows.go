@@ -54,8 +54,6 @@ func main() {
 
 	cfg := loadConfig()
 	s := newSession(!*noCapture)
-	s.setConfig(cfg)
-	s.logEnvironment()
 	defer s.CloseLog()
 	if err := runNativeUI(s, cfg); err != nil {
 		s.logError("创建主窗口失败: %v", err)

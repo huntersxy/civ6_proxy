@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -139,7 +141,7 @@ var virtualSubnetCandidates = []string{
 
 // SelectVirtualSubnet picks a /24 that does not overlap any local subnet or
 // IPv4 route.
-func SelectVirtualSubnet() (*net.IPNet, error) {
+func SelectVirtualSubnet(reserved ...net.IP) (*net.IPNet, error) {
 	used := localIPv4Subnets()
 	for _, candidate := range virtualSubnetCandidates {
 		_, network, err := net.ParseCIDR(candidate)
@@ -147,6 +149,12 @@ func SelectVirtualSubnet() (*net.IPNet, error) {
 			continue
 		}
 		conflict := false
+		for _, address := range reserved {
+			if network.Contains(address) {
+				conflict = true
+				break
+			}
+		}
 		for _, existing := range used {
 			ones, _ := existing.Mask.Size()
 			if ones == 0 {
@@ -216,25 +224,133 @@ func localIPv4Subnets() []*net.IPNet {
 
 // EnsureFirewallRule creates or refreshes the inbound UDP rule for the
 // selected virtual subnet.
-func EnsureFirewallRule(subnet *net.IPNet) error {
+func EnsureFirewallRule(ctx context.Context, subnet *net.IPNet) error {
 	const name = "Civ6Relay-Game-Inbound"
-	_, _ = runHiddenOutput("netsh", "advfirewall", "firewall", "delete", "rule", "name="+name)
-	output, err := runHiddenOutput("netsh", "advfirewall", "firewall", "add", "rule",
-		"name="+name,
-		"dir=in",
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	config := []string{
 		"action=allow",
 		"protocol=UDP",
 		"localport=62056,62900-62999",
-		"remoteip="+subnet.String(),
+		"remoteip=" + subnet.String(),
 		"profile=any",
 		"enable=yes",
-	)
+	}
+	update := append([]string{"advfirewall", "firewall", "set", "rule", "name=" + name, "dir=in", "new"}, config...)
+	if _, err := runHiddenOutputContext(ctx, "netsh", update...); err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("配置 Windows 防火墙失败: %w", ctx.Err())
+	}
+	create := append([]string{"advfirewall", "firewall", "add", "rule", "name=" + name, "dir=in"}, config...)
+	output, err := runHiddenOutputContext(ctx, "netsh", create...)
 	if err != nil {
 		msg := strings.TrimSpace(output)
 		if msg == "" {
 			msg = err.Error()
 		}
 		return fmt.Errorf("配置 Windows 防火墙失败: %s", msg)
+	}
+	return nil
+}
+
+func EnsureP2PFirewallRule(ctx context.Context, localPort uint16, peers []netip.Addr) error {
+	const (
+		legacyName   = "Civ6Relay-P2P-Peers"
+		inboundName  = "Civ6Relay-P2P-Inbound"
+		outboundName = "Civ6Relay-P2P-Outbound"
+	)
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	if localPort == 0 || len(peers) == 0 {
+		for _, name := range []string{legacyName, inboundName, outboundName} {
+			if err := deleteFirewallRule(ctx, name); err != nil {
+				return fmt.Errorf("移除 P2P 防火墙规则失败: %w", err)
+			}
+		}
+		return nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("无法确定客户端程序路径: %w", err)
+	}
+	seen := make(map[string]struct{}, len(peers))
+	addresses := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		ip := peer.Unmap()
+		if !ip.Is4() || !ip.IsGlobalUnicast() {
+			continue
+		}
+		address := ip.String()
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
+	if len(addresses) == 0 {
+		return EnsureP2PFirewallRule(ctx, 0, nil)
+	}
+	slices.Sort(addresses)
+	baseConfig := []string{
+		"action=allow",
+		`program="` + executable + `"`,
+		"protocol=UDP",
+		"localport=" + strconv.Itoa(int(localPort)),
+		"remoteip=" + strings.Join(addresses, ","),
+		"profile=any",
+		"enable=yes",
+	}
+	for _, rule := range []struct {
+		name      string
+		direction string
+	}{{inboundName, "in"}, {outboundName, "out"}} {
+		update := append([]string{"advfirewall", "firewall", "set", "rule", "name=" + rule.name,
+			"dir=" + rule.direction, "new"}, baseConfig...)
+		if _, err := runHiddenOutputContext(ctx, "netsh", update...); err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("配置 P2P 防火墙规则失败: %w", ctx.Err())
+		}
+		create := append([]string{"advfirewall", "firewall", "add", "rule", "name=" + rule.name,
+			"dir=" + rule.direction}, baseConfig...)
+		output, err := runHiddenOutputContext(ctx, "netsh", create...)
+		if err != nil {
+			msg := strings.TrimSpace(output)
+			if msg == "" {
+				msg = err.Error()
+			}
+			return fmt.Errorf("配置 P2P %s 防火墙规则失败: %s", map[string]string{"in": "入站", "out": "出站"}[rule.direction], msg)
+		}
+	}
+	return deleteFirewallRule(ctx, legacyName)
+}
+
+func deleteFirewallRule(ctx context.Context, name string) error {
+	output, showErr := runHiddenOutputContext(ctx, "netsh", "advfirewall", "firewall", "show", "rule", "name="+name)
+	if showErr != nil {
+		message := strings.ToLower(strings.TrimSpace(output))
+		if strings.Contains(message, "no rules match") || strings.Contains(message, "no rule match") ||
+			(strings.Contains(message, "匹配") && (strings.Contains(message, "没有") || strings.Contains(message, "找不到") || strings.Contains(message, "未找到"))) {
+			return nil
+		}
+		if output == "" {
+			return fmt.Errorf("检查 %s: %w", name, showErr)
+		}
+		return fmt.Errorf("检查 %s: %s", name, strings.TrimSpace(output))
+	}
+	if !strings.Contains(strings.ToLower(output), strings.ToLower(name)) {
+		return nil
+	}
+	output, err := runHiddenOutputContext(ctx, "netsh", "advfirewall", "firewall", "delete", "rule", "name="+name)
+	if err != nil {
+		message := strings.TrimSpace(output)
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("删除 %s: %s", name, message)
 	}
 	return nil
 }
@@ -319,8 +435,13 @@ func FormatRelay(host string, port int) string {
 }
 
 func runHiddenOutput(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	return runHiddenOutputTimeout(5*time.Second, name, args...)
+}
+
+func runHiddenOutputContext(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -512,11 +633,9 @@ func QueryDefender() DefenderInfo {
 func runHiddenOutputTimeout(timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	out, err := cmd.CombinedOutput()
+	out, err := runHiddenOutputContext(ctx, name, args...)
 	if ctx.Err() == context.DeadlineExceeded {
-		return string(out), fmt.Errorf("命令超时 (%s)", timeout)
+		return out, fmt.Errorf("命令超时 (%s)", timeout)
 	}
-	return string(out), err
+	return out, err
 }

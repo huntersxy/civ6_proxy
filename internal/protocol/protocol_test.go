@@ -1,61 +1,90 @@
 package protocol
 
 import (
-	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
 
-const (
-	pythonControlHex = "7b22726571756573745f6964223a2230313233343536373839616263646566222c226e616d65223a225c75366434625c7538626435227d"
-	pythonFrame1Hex  = "433652310101000000000000000000000000000000010000000000370000000000000000112233447b22726571756573745f6964223a2230313233343536373839616263646566222c226e616d65223a225c75366434625c7538626435227d00000000000000000000000000000000"
-	pythonFrame2Hex  = "43365231010800070123456789abcdef020300010003f268f26800070102030405060708deadbeef000168656c6c6f051796d12d7496517657a00c41644154"
-)
-
-func TestControlMatchesPython(t *testing.T) {
+func TestControlEncodingUsesCompactUTF8(t *testing.T) {
 	got, err := EncodeControl(HandshakeRequest{RequestID: "0123456789abcdef", Name: "测试"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(got) != pythonControlHex {
-		t.Fatalf("control mismatch\n got %x\nwant %s", got, pythonControlHex)
+	if string(got) != `{"request_id":"0123456789abcdef","name":"测试"}` {
+		t.Fatalf("unexpected control payload %q", got)
 	}
 }
 
-func TestFrameEncodeMatchesPython(t *testing.T) {
-	control, _ := EncodeControl(HandshakeRequest{RequestID: "0123456789abcdef", Name: "测试"})
-	f := Frame{Kind: KindCreate, PacketID: 0x11223344, Payload: control}
-	got, err := f.Encode(nil)
+func TestFrameEncodeUsesCurrentVersion(t *testing.T) {
+	wantPayload := []byte(`{"request_id":"0123456789abcdef","name":"测试"}`)
+	got, err := (&Frame{Kind: KindCreate, PacketID: 0x11223344, Payload: wantPayload}).Encode(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(got) != pythonFrame1Hex {
-		t.Fatalf("frame mismatch\n got %x\nwant %s", got, pythonFrame1Hex)
+	if string(got[:4]) != Magic || got[4] != Version {
+		t.Fatalf("unexpected protocol header %q version=%d", got[:4], got[4])
+	}
+	frame, err := Decode(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.Kind != KindCreate || frame.PacketID != 0x11223344 || string(frame.Payload) != string(wantPayload) {
+		t.Fatalf("decoded fields mismatch: %+v", frame)
+	}
+	if string(got[HeaderSize:HeaderSize+len(wantPayload)]) != string(wantPayload) {
+		t.Fatal("control JSON was not encoded as UTF-8")
 	}
 }
 
-func TestFrameDecodePython(t *testing.T) {
-	raw, _ := hex.DecodeString(pythonFrame2Hex)
-	f, err := Decode(raw)
+func TestDecodeRejectsPreviousProtocolVersion(t *testing.T) {
+	raw, err := (&Frame{Kind: KindCreate}).Encode(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.Kind != KindData || f.RoomID != 0x0123456789abcdef || f.SourceMember != 2 ||
-		f.TargetMember != 3 || f.FragmentIndex != 1 || f.FragmentCount != 3 ||
-		f.SourcePort != 62056 || f.TargetPort != 62056 || f.Sequence != 0x0102030405060708 ||
-		f.PacketID != 0xdeadbeef || string(f.Payload) != "\x00\x01hello" {
-		t.Fatalf("decoded fields mismatch: %+v", f)
+	copy(raw[:4], "C6R1")
+	raw[4] = 1
+	if _, err := Decode(raw); !errors.Is(err, ErrMagic) {
+		t.Fatalf("previous protocol magic returned %v", err)
 	}
+	copy(raw[:4], Magic)
+	if _, err := Decode(raw); !errors.Is(err, ErrVersion) {
+		t.Fatalf("previous protocol version returned %v", err)
+	}
+}
+
+func TestAuthenticatedFrameRoundTripAndVerification(t *testing.T) {
 	key := make([]byte, 32)
 	for i := range key {
 		key[i] = byte(i)
 	}
-	if !f.Verified(key) {
+	frame := Frame{
+		Kind: KindData, RoomID: 0x0123456789abcdef, SourceMember: 2,
+		TargetMember: 3, FragmentIndex: 1, FragmentCount: 3,
+		SourcePort: 62056, TargetPort: 62056, Sequence: 0x0102030405060708,
+		PacketID: 0xdeadbeef, Payload: []byte("\x00\x01hello"),
+	}
+	raw, err := frame.Encode(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Kind != frame.Kind || decoded.RoomID != frame.RoomID || decoded.SourceMember != frame.SourceMember ||
+		decoded.TargetMember != frame.TargetMember || decoded.FragmentIndex != frame.FragmentIndex ||
+		decoded.FragmentCount != frame.FragmentCount || decoded.SourcePort != frame.SourcePort ||
+		decoded.TargetPort != frame.TargetPort || decoded.Sequence != frame.Sequence || decoded.PacketID != frame.PacketID ||
+		string(decoded.Payload) != string(frame.Payload) {
+		t.Fatalf("decoded fields mismatch: %+v", decoded)
+	}
+	if !decoded.Verified(key) {
 		t.Fatal("HMAC verification failed")
 	}
 	key[0] ^= 1
-	if f.Verified(key) {
+	if decoded.Verified(key) {
 		t.Fatal("verification succeeded with wrong key")
 	}
 }
@@ -87,11 +116,39 @@ func TestEncodeAuthenticatedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAppendEncodeReusesBuffer(t *testing.T) {
+	key := make([]byte, 32)
+	auth := NewAuthenticator(key)
+	frame := Frame{Kind: KindData, Payload: []byte("room data"), FragmentCount: 1}
+	buffer := make([]byte, 0, MaxOuterDatagram+1)
+	buffer = append(buffer, 42)
+	raw, err := frame.AppendEncode(buffer, auth)
+	if err != nil || &raw[0] != &buffer[0] || raw[0] != 42 || !auth.Verify(raw[1:]) {
+		t.Fatalf("invalid encoded frame or buffer: %v", err)
+	}
+	decoded, err := DecodeView(raw[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[1+HeaderSize] ^= 1
+	if decoded.Payload[0] == 'r' || auth.Verify(raw[1:]) {
+		t.Fatal("payload view or tag validation failed")
+	}
+	raw, err = frame.AppendEncode(buffer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err = Decode(raw[1:])
+	if err != nil || decoded.AuthTag != [AuthTagSize]byte{} || decoded.Flags&FlagAuthenticated != 0 {
+		t.Fatalf("unsigned frame reused the previous tag: %+v %v", decoded, err)
+	}
+}
+
 func TestDecodeRejectsGarbage(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		[]byte("short"),
-		append(bytesOf(pythonFrame1Hex), 0),
+		append(make([]byte, HeaderSize+AuthTagSize), 0),
 	}
 	for _, c := range cases {
 		if _, err := Decode(c); err == nil {
@@ -99,12 +156,6 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 		}
 	}
 }
-
-func bytesOf(h string) []byte {
-	b, _ := hex.DecodeString(h)
-	return b
-}
-
 func TestReplayWindow(t *testing.T) {
 	var w ReplayWindow
 	if !w.Accept(100) {

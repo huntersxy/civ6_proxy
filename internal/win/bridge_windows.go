@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"civ6relay/internal/packet"
 	"civ6relay/internal/protocol"
@@ -15,8 +16,11 @@ import (
 )
 
 const (
-	discoveryPortMin = 62900
-	discoveryPortMax = 62999
+	discoveryPortMin   = 62900
+	discoveryPortMax   = 62999
+	firstVirtualMember = 2
+	lastVirtualMember  = 9
+	injectionQueueSize = 256
 )
 
 // BridgeStats is a snapshot of packet bridge counters.
@@ -37,12 +41,14 @@ type injectRequest struct {
 // Bridge captures Civ 6 LAN traffic with WinDivert and tunnels it through the
 // relay client.
 type Bridge struct {
-	client  *tunnel.Client
-	subnet  *net.IPNet
-	localIP net.IP
-	route   RouteInfo
-	handle  *DivertHandle
-	logf    func(level, msg string)
+	client          *tunnel.Client
+	memberID        uint8
+	memberIPs       [lastVirtualMember + 1]net.IP
+	route           RouteInfo
+	gameHandle      *DivertHandle
+	discoveryHandle *DivertHandle
+	logf            func(level, msg string)
+	recordPacket    func([]byte)
 
 	injectCh chan injectRequest
 	stop     chan struct{}
@@ -54,46 +60,63 @@ type Bridge struct {
 	captured  atomic.Uint64
 	injected  atomic.Uint64
 	dropped   atomic.Uint64
-	ipID      atomic.Uint32
+	ipID      uint16
 }
 
 // StartBridge opens WinDivert and starts relaying for the given subnet.
-func StartBridge(client *tunnel.Client, subnet *net.IPNet, route RouteInfo, driverDir string, logf func(level, msg string)) (*Bridge, error) {
-	if client == nil || subnet == nil {
+func StartBridge(client *tunnel.Client, subnet *net.IPNet, route RouteInfo, driverDir string, logf func(level, msg string), recordPacket func([]byte)) (*Bridge, error) {
+	if client == nil || subnet == nil || route.LocalIP.To4() == nil || route.IfIndex == 0 {
 		return nil, errors.New("bridge requires a client and subnet")
+	}
+	memberID := client.MemberID()
+	if memberID < firstVirtualMember || memberID > lastVirtualMember {
+		return nil, errors.New("bridge requires an active room member")
 	}
 	if logf == nil {
 		logf = func(string, string) {}
 	}
-	broadcast := VirtualMemberIP(subnet, 255)
-	network := subnet.IP.Mask(subnet.Mask)
-	filter := fmt.Sprintf(
-		"outbound and ip and udp and ((ip.DstAddr == 255.255.255.255 and udp.DstPort >= %d and udp.DstPort <= %d) or (ip.DstAddr >= %s and ip.DstAddr <= %s))",
-		discoveryPortMin, discoveryPortMax, network, broadcast,
-	)
-	handle, err := OpenDivert(driverDir, filter)
+	gameFilter, discoveryFilter := bridgeFilters(subnet)
+	discovery, err := openDivert(driverDir, discoveryFilter, windivertFlagSniff|windivertFlagRecvOnly)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("打开房间发现抓包失败: %w", err)
+	}
+	game, err := OpenDivert(driverDir, gameFilter)
+	if err != nil {
+		discovery.Close()
+		return nil, fmt.Errorf("打开游戏流量抓包失败: %w", err)
 	}
 	b := &Bridge{
-		client:   client,
-		subnet:   subnet,
-		localIP:  route.LocalIP,
-		route:    route,
-		handle:   handle,
-		logf:     logf,
-		injectCh: make(chan injectRequest, 2048),
-		stop:     make(chan struct{}),
+		client:          client,
+		memberID:        memberID,
+		route:           route,
+		gameHandle:      game,
+		discoveryHandle: discovery,
+		logf:            logf,
+		recordPacket:    recordPacket,
+		injectCh:        make(chan injectRequest, injectionQueueSize),
+		stop:            make(chan struct{}),
+	}
+	for id := uint8(firstVirtualMember); id <= lastVirtualMember; id++ {
+		b.memberIPs[id] = VirtualMemberIP(subnet, id)
 	}
 	rnd := protocol.RandomBytes(2)
-	b.ipID.Store(uint32(rnd[0])<<8 | uint32(rnd[1]))
+	b.ipID = uint16(rnd[0])<<8 | uint16(rnd[1])
 	b.running.Store(true)
 	client.SetDataHandler(b.enqueue)
-	b.wg.Add(2)
-	go b.recvLoop()
+	b.wg.Add(3)
+	go b.recvLoop(game, false)
+	go b.recvLoop(discovery, true)
 	go b.injectLoop()
 	logf("info", fmt.Sprintf("WinDivert 已启动，虚拟网段 %s", subnet))
 	return b, nil
+}
+
+func bridgeFilters(subnet *net.IPNet) (game, discovery string) {
+	game = fmt.Sprintf("outbound and ip and udp and ip.DstAddr >= %s and ip.DstAddr <= %s",
+		VirtualMemberIP(subnet, firstVirtualMember), VirtualMemberIP(subnet, lastVirtualMember))
+	discovery = fmt.Sprintf("outbound and ip and udp and ip.DstAddr == 255.255.255.255 and udp.DstPort >= %d and udp.DstPort <= %d",
+		discoveryPortMin, discoveryPortMax)
+	return
 }
 
 // Running reports whether the capture loop is alive.
@@ -119,68 +142,68 @@ func (b *Bridge) Stop() {
 	}
 	b.stopOnce.Do(func() {
 		b.running.Store(false)
-		if b.handle != nil {
-			b.handle.Shutdown()
-		}
-		close(b.stop)
-		if b.handle != nil {
-			b.handle.Close()
-		}
-		b.wg.Wait()
 		b.client.SetDataHandler(nil)
+		close(b.stop)
+		b.gameHandle.Shutdown()
+		b.discoveryHandle.Shutdown()
+		b.wg.Wait()
+		b.gameHandle.Close()
+		b.discoveryHandle.Close()
+		clearQueuedPackets(b.injectCh)
 	})
 }
 
-func (b *Bridge) recvLoop() {
-	defer b.wg.Done()
-	buf := make([]byte, windivertPacketBufSize)
+func clearQueuedPackets(ch chan injectRequest) {
 	for {
-		pkt, addr, err := b.handle.Recv(buf)
-		if err != nil {
-			if b.running.Load() {
-				b.running.Store(false)
-				b.logf("error", fmt.Sprintf("WinDivert 已停止: %v", err))
-			}
+		select {
+		case <-ch:
+		default:
 			return
 		}
-		b.handlePacket(pkt, &addr)
 	}
 }
 
-func (b *Bridge) handlePacket(raw []byte, addr *wdAddress) {
+func (b *Bridge) recvLoop(handle *DivertHandle, discovery bool) {
+	defer b.wg.Done()
+	buf := make([]byte, packet.MaxIPv4Size)
+	var addr wdAddress
+	var received uint32
+	for b.running.Load() {
+		pkt, err := handle.recv(buf, &addr, &received)
+		if err != nil {
+			if b.running.CompareAndSwap(true, false) {
+				b.logf("error", fmt.Sprintf("WinDivert 已停止: %v", err))
+				go b.Stop()
+			}
+			return
+		}
+		if b.running.Load() {
+			b.handlePacket(pkt, discovery)
+		}
+	}
+}
+
+func (b *Bridge) handlePacket(raw []byte, discovery bool) {
 	d, err := packet.ParseIPv4UDP(raw)
 	if err != nil {
+		b.dropped.Add(1)
 		return
 	}
-	if d.TargetIP.Equal(net.IPv4bcast) {
+	if b.recordPacket != nil {
+		b.recordPacket(raw)
+	}
+	if discovery {
 		b.discovery.Add(1)
-		b.client.SendGameData(255, d.SourcePort, d.TargetPort, d.Payload, true)
-		// Keep the original broadcast on the real LAN as well.
-		if err := b.handle.Send(raw, addr); err != nil {
-			b.logf("warn", fmt.Sprintf("回注局域网广播失败: %v", err))
-		}
-		return
-	}
-	if b.subnet.Contains(d.TargetIP) {
-		dst := d.TargetIP.To4()
-		var target uint8
-		if dst != nil {
-			target = dst[3]
-		}
-		if target >= 2 && target <= 9 && target != b.client.MemberID() {
-			if b.client.SendGameData(target, d.SourcePort, d.TargetPort, d.Payload, false) {
-				b.captured.Add(1)
-			} else {
-				b.dropped.Add(1)
-			}
-		} else {
+		if !b.client.SendGameData(255, d.SourcePort, d.TargetPort, d.Payload, true) {
 			b.dropped.Add(1)
 		}
 		return
 	}
-	// Defensive: a filter mismatch must not swallow unrelated traffic.
-	if err := b.handle.Send(raw, addr); err != nil {
-		b.logf("warn", fmt.Sprintf("回注未匹配数据包失败: %v", err))
+	target := d.TargetIP[3]
+	if target != b.memberID && b.client.SendGameData(target, d.SourcePort, d.TargetPort, d.Payload, false) {
+		b.captured.Add(1)
+	} else {
+		b.dropped.Add(1)
 	}
 }
 
@@ -192,7 +215,7 @@ func (b *Bridge) enqueue(sourceMember uint8, sourcePort, targetPort uint16, payl
 		sourceMember: sourceMember,
 		sourcePort:   sourcePort,
 		targetPort:   targetPort,
-		payload:      append([]byte(nil), payload...),
+		payload:      payload,
 	}
 	select {
 	case b.injectCh <- req:
@@ -203,37 +226,41 @@ func (b *Bridge) enqueue(sourceMember uint8, sourcePort, targetPort uint16, payl
 
 func (b *Bridge) injectLoop() {
 	defer b.wg.Done()
-	for {
+	buf := make([]byte, 0, packet.MaxIPv4Size)
+	addr := wdAddress{Bits: windivertIPChecksum | windivertUDPChecksum, IfIdx: b.route.IfIndex}
+	var nextLog time.Time
+	for b.running.Load() {
 		select {
 		case <-b.stop:
 			return
 		case req := <-b.injectCh:
-			b.injectOne(req)
+			if err := b.injectOne(buf, &addr, req); err != nil {
+				b.dropped.Add(1)
+				if b.running.Load() && time.Now().After(nextLog) {
+					b.logf("warn", fmt.Sprintf("注入游戏数据包失败: %v", err))
+					nextLog = time.Now().Add(5 * time.Second)
+				}
+			} else {
+				b.injected.Add(1)
+			}
 		}
 	}
 }
 
-func (b *Bridge) injectOne(req injectRequest) {
-	sourceIP := VirtualMemberIP(b.subnet, req.sourceMember)
-	if sourceIP == nil {
-		b.dropped.Add(1)
-		return
+func (b *Bridge) injectOne(buf []byte, addr *wdAddress, req injectRequest) error {
+	if req.sourceMember < firstVirtualMember || req.sourceMember > lastVirtualMember {
+		return errors.New("无效的虚拟成员地址")
 	}
-	id := uint16(b.ipID.Add(1))
-	raw, err := packet.BuildIPv4UDP(sourceIP, b.localIP, req.sourcePort, req.targetPort, req.payload, 128, id)
+	b.ipID++
+	raw, err := packet.AppendIPv4UDP(buf, b.memberIPs[req.sourceMember], b.route.LocalIP, req.sourcePort, req.targetPort, req.payload, 128, b.ipID)
 	if err != nil {
-		b.dropped.Add(1)
-		return
+		return err
 	}
-	var addr wdAddress
-	addr.setLayer(windivertLayerNetwork)
-	addr.setOutbound(false)
-	addr.IfIdx = b.route.IfIndex
-	addr.SubIfIdx = 0
-	if err := b.handle.Send(raw, &addr); err != nil {
-		b.dropped.Add(1)
-		b.logf("warn", fmt.Sprintf("注入游戏数据包失败: %v", err))
-		return
+	if err := b.gameHandle.Send(raw, addr); err != nil {
+		return err
 	}
-	b.injected.Add(1)
+	if b.recordPacket != nil {
+		b.recordPacket(raw)
+	}
+	return nil
 }

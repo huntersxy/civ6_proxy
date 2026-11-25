@@ -15,52 +15,76 @@ const (
 	wsCaption          = 0x00C00000
 	wsSysMenu          = 0x00080000
 	wsMinimizeBox      = 0x00020000
+	wsMaximizeBox      = 0x00010000
+	wsTabStop          = 0x00010000
+	wsThickFrame       = 0x00040000
 	wsChild            = 0x40000000
 	wsVisible          = 0x10000000
-	wsBorder           = 0x00800000
 	wsVScroll          = 0x00200000
 	wsClipChildren     = 0x02000000
-	wsClipSiblings     = 0x04000000
 	wsExClientEdge     = 0x00000200
 	esAutoHScroll      = 0x00000080
 	esAutoVScroll      = 0x00000040
 	esMultiline        = 0x00000004
 	esReadOnly         = 0x00000800
-	bsPushButton       = 0x00000000
+	ssNoPrefix         = 0x00000080
+	ssEtchedHorz       = 0x00000010
+	ssEndEllipsis      = 0x00004000
+	ssRight            = 0x00000002
+	bsAutoCheck        = 0x00000003
+	cbsDropdown        = 0x00000002
+	cbsAutoHScroll     = 0x00000040
 	lvsReport          = 0x00000001
 	lvsSingleSel       = 0x00000004
 	lvsShowSelAlways   = 0x00000008
 	lvsExFullRowSelect = 0x00000020
-	lvsExGridLines     = 0x00000001
+	lvsExLabelTip      = 0x00004000
+	lvsNoSortHeader    = 0x00008000
 	lvsExDoubleBuffer  = 0x00010000
 
-	wmSetFont   = 0x0030
-	wmCommand   = 0x0111
-	wmTimer     = 0x0113
-	wmClose     = 0x0010
-	wmDestroy   = 0x0002
-	wmAppInvoke = 0x8001
+	wmSetFont    = 0x0030
+	wmCommand    = 0x0111
+	wmTimer      = 0x0113
+	wmClose      = 0x0010
+	wmDestroy    = 0x0002
+	wmSize       = 0x0005
+	wmKeyDown    = 0x0100
+	wmGetMinMax  = 0x0024
+	wmAppInvoke  = 0x8001
+	wmAppRefresh = 0x8002
+
+	rdwInvalidate  = 0x0001
+	rdwErase       = 0x0004
+	rdwAllChildren = 0x0080
+	rdwFrame       = 0x0400
+
+	pbmSetPos     = 0x0402
+	pbmSetRange32 = 0x0406
+	bmGetCheck    = 0x00f0
+	bmSetCheck    = 0x00f1
 
 	emSetSel                    = 0x00B1
-	emReplaceSel                = 0x00C2
 	emSetReadOnly               = 0x00CF
 	emScrollCaret               = 0x00B7
+	emSetLimitText              = 0x00C5
+	emSetCueBanner              = 0x1501
+	cbAddString                 = 0x0143
+	cbResetContent              = 0x014B
+	cbSetDroppedHeight          = 0x0153
 	lvmFirst                    = 0x1000
 	lvmInsertColumnW            = lvmFirst + 97
 	lvmInsertItemW              = lvmFirst + 77
 	lvmSetItemTextW             = lvmFirst + 116
 	lvmDeleteAllItems           = lvmFirst + 9
+	lvmSetColumnWidth           = lvmFirst + 30
 	lvmSetExtendedListViewStyle = lvmFirst + 54
 
-	lvcfFmt      = 0x00000001
-	lvcfWidth    = 0x00000002
-	lvcfText     = 0x00000004
-	lvcfSubItem  = 0x00000008
-	lvcfmtLeft   = 0x00000000
-	lvcfmtCenter = 0x00000002
-	lvifText     = 0x00000001
+	lvcfText    = 0x00000004
+	lvcfSubItem = 0x00000008
+	lvifText    = 0x00000001
 
 	iccListViewClasses = 0x00000001
+	iccProgressClass   = 0x00000020
 	iccStandardClasses = 0x00004000
 
 	mbOK              = 0x00000000
@@ -76,15 +100,24 @@ const (
 	cfUnicodeText = 13
 	gmemMoveable  = 0x0002
 
-	logPixelsY     = 90
-	defaultCharset = 1
-	clearType      = 5
-	fwNormal       = 400
-	fwBold         = 700
-	swShowNormal   = 1
-	smCxScreen     = 0
-	smCyScreen     = 1
-	bnClicked      = 0
+	logPixelsY         = 90
+	defaultCharset     = 1
+	clearType          = 5
+	fwNormal           = 400
+	fwBold             = 700
+	swShowNormal       = 1
+	swShow             = 5
+	swHide             = 0
+	smCxVScroll        = 2
+	bnClicked          = 0
+	enChange           = 0x0300
+	vkEscape           = 0x1B
+	vkReturn           = 0x0D
+	spiGetWorkArea     = 0x0030
+	spiGetHighContrast = 0x0042
+	hcfHighContrastOn  = 0x00000001
+	colorWindow        = 5
+	colorWindowText    = 8
 )
 
 type wndClassExW struct {
@@ -107,6 +140,19 @@ type rect struct {
 	Top    int32
 	Right  int32
 	Bottom int32
+}
+
+type point struct {
+	X, Y int32
+}
+
+type minMaxInfo struct {
+	Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize point
+}
+
+type highContrast struct {
+	Size, Flags uint32
+	Scheme      *uint16
 }
 
 type msgW struct {
@@ -185,6 +231,7 @@ type openFileNameW struct {
 var (
 	user32   = syscall.NewLazyDLL("user32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	shell32  = syscall.NewLazyDLL("shell32.dll")
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	comctl32 = syscall.NewLazyDLL("comctl32.dll")
 	comdlg32 = syscall.NewLazyDLL("comdlg32.dll")
@@ -197,7 +244,10 @@ var (
 	procDestroyWindow        = user32.NewProc("DestroyWindow")
 	procShowWindow           = user32.NewProc("ShowWindow")
 	procUpdateWindow         = user32.NewProc("UpdateWindow")
+	procRedrawWindow         = user32.NewProc("RedrawWindow")
 	procGetMessageW          = user32.NewProc("GetMessageW")
+	procIsDialogMessageW     = user32.NewProc("IsDialogMessageW")
+	procIsChild              = user32.NewProc("IsChild")
 	procTranslateMessage     = user32.NewProc("TranslateMessage")
 	procDispatchMessageW     = user32.NewProc("DispatchMessageW")
 	procPostQuitMessage      = user32.NewProc("PostQuitMessage")
@@ -208,9 +258,17 @@ var (
 	procGetWindowTextLengthW = user32.NewProc("GetWindowTextLengthW")
 	procEnableWindow         = user32.NewProc("EnableWindow")
 	procSetFocus             = user32.NewProc("SetFocus")
+	procGetFocus             = user32.NewProc("GetFocus")
+	procMoveWindow           = user32.NewProc("MoveWindow")
+	procGetClientRect        = user32.NewProc("GetClientRect")
+	procGetWindowRect        = user32.NewProc("GetWindowRect")
+	procSystemParametersInfo = user32.NewProc("SystemParametersInfoW")
+	procGetSysColor          = user32.NewProc("GetSysColor")
+	procLoadCursorW          = user32.NewProc("LoadCursorW")
 	procSetTimer             = user32.NewProc("SetTimer")
 	procKillTimer            = user32.NewProc("KillTimer")
 	procMessageBoxW          = user32.NewProc("MessageBoxW")
+	procShellExecuteW        = shell32.NewProc("ShellExecuteW")
 	procFindWindowW          = user32.NewProc("FindWindowW")
 	procSetForegroundWindow  = user32.NewProc("SetForegroundWindow")
 	procGetSystemMetrics     = user32.NewProc("GetSystemMetrics")
@@ -230,6 +288,7 @@ var (
 	procGetDeviceCaps        = gdi32.NewProc("GetDeviceCaps")
 	procCreateSolidBrush     = gdi32.NewProc("CreateSolidBrush")
 	procSetBkMode            = gdi32.NewProc("SetBkMode")
+	procSetTextColor         = gdi32.NewProc("SetTextColor")
 	procCreateFontW          = gdi32.NewProc("CreateFontW")
 	procDeleteObject         = gdi32.NewProc("DeleteObject")
 	procInitCommonControlsEx = comctl32.NewProc("InitCommonControlsEx")
@@ -237,6 +296,26 @@ var (
 )
 
 var uiDPI uint32 = 96
+
+func openFolder(path string) error {
+	operation, err := syscall.UTF16PtrFromString("open")
+	if err != nil {
+		return err
+	}
+	target, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := procShellExecuteW.Call(0,
+		uintptr(unsafe.Pointer(operation)), uintptr(unsafe.Pointer(target)), 0, 0, uintptr(swShowNormal))
+	if result > 32 {
+		return nil
+	}
+	if callErr != syscall.Errno(0) {
+		return callErr
+	}
+	return fmt.Errorf("ShellExecuteW returned %d", result)
+}
 
 func initDPI() {
 	dc, _, _ := procGetDC.Call(0)
@@ -273,7 +352,7 @@ func setFont(control, font syscall.Handle) {
 	procSendMessageW.Call(uintptr(control), wmSetFont, uintptr(font), 1)
 }
 
-func createChild(parent syscall.Handle, exStyle uint32, class, text string, style uint32, x, y, w, h int32, id uint32) syscall.Handle {
+func createChild(parent syscall.Handle, exStyle uint32, class, text string, style uint32, id uint32) syscall.Handle {
 	classPtr, _ := syscall.UTF16PtrFromString(class)
 	var textPtr *uint16
 	if text != "" {
@@ -285,7 +364,7 @@ func createChild(parent syscall.Handle, exStyle uint32, class, text string, styl
 		uintptr(unsafe.Pointer(classPtr)),
 		uintptr(unsafe.Pointer(textPtr)),
 		uintptr(style|wsChild|wsVisible),
-		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		0, 0, 0, 0,
 		uintptr(parent), uintptr(id), hInstance, 0,
 	)
 	return syscall.Handle(r)
@@ -304,6 +383,11 @@ func windowText(h syscall.Handle) string {
 func setWindowText(h syscall.Handle, text string) {
 	ptr, _ := syscall.UTF16PtrFromString(text)
 	procSetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(ptr)))
+}
+
+func sendText(h syscall.Handle, message uint32, wparam uintptr, text string) {
+	ptr, _ := syscall.UTF16PtrFromString(text)
+	procSendMessageW.Call(uintptr(h), uintptr(message), wparam, uintptr(unsafe.Pointer(ptr)))
 }
 
 func enableWindow(h syscall.Handle, enabled bool) {

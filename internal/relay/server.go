@@ -1,4 +1,4 @@
-// Package relay implements the in-memory room server for Civ6Relay v1.
+// Package relay implements the in-memory room server for Civ6Relay v2.
 package relay
 
 import (
@@ -6,8 +6,9 @@ import (
 	"encoding/binary"
 	"log"
 	"net"
-	"sort"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"civ6relay/internal/protocol"
@@ -19,31 +20,39 @@ const (
 	handshakePacketRate = 5.0
 	handshakeByteRate   = 12000.0
 	handshakeBurst      = 2.0
+
+	DefaultMemberPacketRate = 5000
+	DefaultMemberByteRate   = 1_250_000
 )
 
 // Config configures a Server. Zero values are replaced with defaults.
 type Config struct {
-	MaxRooms int
-	Logger   *log.Logger
-	Now      func() time.Time
+	MaxRooms         int
+	MemberPacketRate int
+	MemberByteRate   int
+	Logger           *log.Logger
+	Now              func() time.Time
 }
 
 // Server is a concurrency-safe relay room manager.
 type Server struct {
 	maxRooms int
+	limit    tokenBucket
 	log      *log.Logger
 	now      func() time.Time
 	start    time.Time
 
-	mu              sync.Mutex
+	roomsMu         sync.RWMutex
 	roomsByID       map[uint64]*room
 	roomsByCode     map[string]*room
+	memberCount     atomic.Int64
+	handshakeMu     sync.Mutex
 	handshakeCache  map[handshakeKey]cachedHandshake
-	handshakeLimits map[string]*handshakeLimit
+	handshakeLimits map[netip.Addr]*handshakeLimit
 }
 
 type handshakeKey struct {
-	endpoint  string
+	endpoint  netip.AddrPort
 	kind      protocol.Kind
 	requestID string
 }
@@ -66,6 +75,12 @@ func New(cfg Config) *Server {
 	if cfg.MaxRooms > maxRoomsCeiling {
 		cfg.MaxRooms = maxRoomsCeiling
 	}
+	if cfg.MemberPacketRate <= 0 {
+		cfg.MemberPacketRate = DefaultMemberPacketRate
+	}
+	if cfg.MemberByteRate <= 0 {
+		cfg.MemberByteRate = DefaultMemberByteRate
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
@@ -74,13 +89,14 @@ func New(cfg Config) *Server {
 	}
 	return &Server{
 		maxRooms:        cfg.MaxRooms,
+		limit:           newTokenBucket(float64(cfg.MemberPacketRate), float64(cfg.MemberByteRate), 2),
 		log:             cfg.Logger,
 		now:             cfg.Now,
 		start:           cfg.Now(),
 		roomsByID:       make(map[uint64]*room),
 		roomsByCode:     make(map[string]*room),
 		handshakeCache:  make(map[handshakeKey]cachedHandshake),
-		handshakeLimits: make(map[string]*handshakeLimit),
+		handshakeLimits: make(map[netip.Addr]*handshakeLimit),
 	}
 }
 
@@ -90,26 +106,39 @@ func (s *Server) clock() float64 {
 
 // Handle processes one received datagram and returns the datagrams to send.
 func (s *Server) Handle(datagram []byte, addr *net.UDPAddr) []Outbound {
-	frame, err := protocol.Decode(datagram)
-	if err != nil || addr == nil {
+	if addr == nil {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if frame.Kind == protocol.KindCreate || frame.Kind == protocol.KindJoin {
-		if frame.Flags&protocol.FlagAuthenticated != 0 {
-			return nil
-		}
-		if !s.allowHandshakeLocked(addr.IP.String(), len(datagram)) {
-			return nil
-		}
-		return s.handleHandshakeLocked(&frame, addr)
-	}
-	return s.handleAuthenticatedLocked(&frame, addr, len(datagram))
+	var batch Batch
+	s.HandleInto(datagram, addr.AddrPort(), &batch)
+	return batch.Datagrams
 }
 
-func (s *Server) allowHandshakeLocked(ip string, size int) bool {
-	now := s.clock()
+// HandleInto replaces batch with the datagrams to send for one received frame.
+// The caller owns batch and can reuse it after sending its contents.
+func (s *Server) HandleInto(datagram []byte, addr netip.AddrPort, batch *Batch) {
+	batch.reset()
+	frame, err := protocol.DecodeView(datagram)
+	if err != nil || !addr.IsValid() {
+		return
+	}
+	addr = netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
+	if frame.Kind == protocol.KindCreate || frame.Kind == protocol.KindJoin {
+		if frame.Flags&protocol.FlagAuthenticated == 0 {
+			s.handleHandshake(&frame, addr, len(datagram), batch)
+		}
+		return
+	}
+
+	s.roomsMu.RLock()
+	r := s.roomsByID[frame.RoomID]
+	s.roomsMu.RUnlock()
+	if r != nil {
+		s.handleAuthenticated(r, &frame, addr, datagram, batch)
+	}
+}
+
+func (s *Server) allowHandshakeLocked(ip netip.Addr, size int, now float64) bool {
 	state := s.handshakeLimits[ip]
 	if state == nil {
 		state = &handshakeLimit{bucket: newTokenBucket(handshakePacketRate, handshakeByteRate, handshakeBurst)}
@@ -122,8 +151,7 @@ func (s *Server) allowHandshakeLocked(ip string, size int) bool {
 // Cleanup advances timers: it expires cached handshakes, marks idle members
 // offline, drops expired members, and closes rooms whose host timed out.
 func (s *Server) Cleanup() []Outbound {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.handshakeMu.Lock()
 	now := s.clock()
 	for key, cached := range s.handshakeCache {
 		if cached.expires <= now {
@@ -135,16 +163,24 @@ func (s *Server) Cleanup() []Outbound {
 			delete(s.handshakeLimits, ip)
 		}
 	}
-	var out []Outbound
-	for _, id := range s.sortedRoomIDsLocked() {
-		r := s.roomsByID[id]
-		if r == nil {
+	s.handshakeMu.Unlock()
+
+	s.roomsMu.RLock()
+	rooms := make([]*room, 0, len(s.roomsByID))
+	for _, r := range s.roomsByID {
+		rooms = append(rooms, r)
+	}
+	s.roomsMu.RUnlock()
+	var batch Batch
+	for _, r := range rooms {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
 			continue
 		}
 		changed := false
 		hostTimeout := false
-		for _, memberID := range r.sortedIDs() {
-			m := r.members[memberID]
+		for slot, m := range r.members {
 			if m == nil {
 				continue
 			}
@@ -159,38 +195,28 @@ func (s *Server) Cleanup() []Outbound {
 					hostTimeout = true
 					break
 				}
-				delete(r.members, m.id)
+				r.members[slot] = nil
+				s.memberCount.Add(-1)
 				changed = true
 				s.log.Printf("member expired room=%s member=%d", r.code, m.id)
 			}
 		}
 		if hostTimeout {
-			out = append(out, s.closeRoomLocked(r, "host_timeout")...)
+			s.closeRoomLocked(r, "host_timeout", &batch)
 		} else if changed {
-			out = append(out, s.peerUpdatesLocked(r)...)
+			s.peerUpdatesLocked(r, &batch)
 		}
+		r.mu.Unlock()
 	}
-	return out
+	return batch.Datagrams
 }
 
 // Stats reports current room and member counts.
 func (s *Server) Stats() (rooms, members int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rooms = len(s.roomsByID)
-	for _, r := range s.roomsByID {
-		members += len(r.members)
-	}
-	return rooms, members
-}
-
-func (s *Server) sortedRoomIDsLocked() []uint64 {
-	ids := make([]uint64, 0, len(s.roomsByID))
-	for id := range s.roomsByID {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
+	s.roomsMu.RLock()
+	rooms, members = len(s.roomsByID), int(s.memberCount.Load())
+	s.roomsMu.RUnlock()
+	return
 }
 
 func (s *Server) newRoomIDLocked() uint64 {
@@ -214,31 +240,13 @@ func (s *Server) newRoomCodeLocked() string {
 		if _, err := rand.Read(b[:]); err != nil {
 			panic("crypto/rand failure: " + err.Error())
 		}
-		code := make([]byte, 10)
+		var code [10]byte
 		for i := range b {
 			code[i] = protocol.RoomCodeAlphabet[int(b[i])&31]
 		}
-		text := string(code)
+		text := string(code[:])
 		if _, exists := s.roomsByCode[text]; !exists {
 			return text
 		}
 	}
-}
-
-func (s *Server) appendSignedLocked(dst []Outbound, m *member, frame protocol.Frame) []Outbound {
-	frame.TargetMember = m.id
-	frame.Sequence = m.outSeq.Next()
-	data, err := frame.Encode(m.token[:])
-	if err != nil {
-		return dst
-	}
-	return append(dst, Outbound{Addr: m.addr, Data: data})
-}
-
-func (s *Server) appendUnsignedLocked(dst []Outbound, addr *net.UDPAddr, frame protocol.Frame) []Outbound {
-	data, err := frame.Encode(nil)
-	if err != nil {
-		return dst
-	}
-	return append(dst, Outbound{Addr: addr, Data: data})
 }

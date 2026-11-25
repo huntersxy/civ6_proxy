@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func addr(port int) *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, byte(port%200+2)), Port: 20000 + port}
 }
 
-func encodeHandshake(t *testing.T, kind protocol.Kind, req protocol.HandshakeRequest) []byte {
+func encodeHandshake(t testing.TB, kind protocol.Kind, req protocol.HandshakeRequest) []byte {
 	t.Helper()
 	payload, err := protocol.EncodeControl(req)
 	if err != nil {
@@ -76,7 +77,7 @@ type hResult struct {
 	raw     []byte
 }
 
-func doHandshake(t *testing.T, s *Server, kind protocol.Kind, req protocol.HandshakeRequest, a *net.UDPAddr) hResult {
+func doHandshake(t testing.TB, s *Server, kind protocol.Kind, req protocol.HandshakeRequest, a *net.UDPAddr) hResult {
 	t.Helper()
 	out := s.Handle(encodeHandshake(t, kind, req), a)
 	if len(out) == 0 {
@@ -104,7 +105,7 @@ func doHandshake(t *testing.T, s *Server, kind protocol.Kind, req protocol.Hands
 	return res
 }
 
-func tokenOf(t *testing.T, w *protocol.WelcomeMessage) []byte {
+func tokenOf(t testing.TB, w *protocol.WelcomeMessage) []byte {
 	t.Helper()
 	token, err := base64.URLEncoding.DecodeString(w.Token)
 	if err != nil {
@@ -116,7 +117,7 @@ func tokenOf(t *testing.T, w *protocol.WelcomeMessage) []byte {
 	return token
 }
 
-func clientFrame(t *testing.T, token []byte, roomID uint64, member uint8, kind protocol.Kind, target uint8, seq uint64, payload []byte) []byte {
+func clientFrame(t testing.TB, token []byte, roomID uint64, member uint8, kind protocol.Kind, target uint8, seq uint64, payload []byte) []byte {
 	t.Helper()
 	var flags protocol.Flags
 	if target == 255 {
@@ -273,7 +274,7 @@ func TestDataUnicastAndBroadcast(t *testing.T) {
 	}
 }
 
-func parseRoomID(t *testing.T, text string) uint64 {
+func parseRoomID(t testing.TB, text string) uint64 {
 	t.Helper()
 	var id uint64
 	if _, err := fmt.Sscanf(text, "%016x", &id); err != nil {
@@ -321,6 +322,57 @@ func TestLeaveAndCloseRoom(t *testing.T) {
 	}
 	if res := doHandshake(t, s, protocol.KindJoin, protocol.HandshakeRequest{RequestID: "9999888877776666", Name: "C", RoomCode: wA.RoomCode}, addr(3)); res.errMsg == nil || res.errMsg.Code != "room_not_found" {
 		t.Fatalf("closed room still joinable: %+v", res.errMsg)
+	}
+}
+
+func TestPathPingAndPongAreRelayedToTheirPeer(t *testing.T) {
+	s, _ := newTestServer(t)
+	a, b := addr(1), addr(2)
+	host := doHandshake(t, s, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "aaaabbbbccccdddd", Name: "A",
+	}, a).welcome
+	guestFrames := decodeOutbound(t, s.Handle(encodeHandshake(t, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "ddddccccbbbbaaaa", Name: "B", RoomCode: host.RoomCode,
+	}), b))
+	var guest protocol.WelcomeMessage
+	if err := protocol.DecodeControl(guestFrames[0].Payload, &guest); err != nil {
+		t.Fatal(err)
+	}
+	hostToken, guestToken := tokenOf(t, host), tokenOf(t, &guest)
+	roomID := parseRoomID(t, host.RoomID)
+	payload := []byte{0, 0, 0, 0, 0, 0, 0, 42}
+
+	out := s.Handle(clientFrame(t, hostToken, roomID, host.MemberID, protocol.KindPathPing, guest.MemberID, 1, payload), a)
+	if len(out) != 1 || out[0].Addr.Addr().Unmap() != b.AddrPort().Addr().Unmap() || out[0].Addr.Port() != uint16(b.Port) {
+		t.Fatalf("path ping did not reach peer: %#v", out)
+	}
+	ping, err := protocol.Decode(out[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ping.Verified(guestToken) || ping.Kind != protocol.KindPathPing || ping.SourceMember != host.MemberID ||
+		ping.TargetMember != guest.MemberID || string(ping.Payload) != string(payload) {
+		t.Fatalf("unexpected relayed path ping: %+v", ping)
+	}
+
+	out = s.Handle(clientFrame(t, guestToken, roomID, guest.MemberID, protocol.KindPathPong, host.MemberID, 1, payload), b)
+	if len(out) != 1 || out[0].Addr.Addr().Unmap() != a.AddrPort().Addr().Unmap() || out[0].Addr.Port() != uint16(a.Port) {
+		t.Fatalf("path pong did not return to peer: %#v", out)
+	}
+	pong, err := protocol.Decode(out[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pong.Verified(hostToken) || pong.Kind != protocol.KindPathPong || pong.SourceMember != guest.MemberID ||
+		pong.TargetMember != host.MemberID || string(pong.Payload) != string(payload) {
+		t.Fatalf("unexpected relayed path pong: %+v", pong)
+	}
+
+	if out := s.Handle(clientFrame(t, hostToken, roomID, host.MemberID, protocol.KindPathPing, broadcastMember, 2, payload), a); len(out) != 0 {
+		t.Fatalf("path ping was broadcast: %#v", out)
+	}
+	if out := s.Handle(clientFrame(t, hostToken, roomID, host.MemberID, protocol.KindPathPing, guest.MemberID, 3, payload[:7]), a); len(out) != 0 {
+		t.Fatalf("invalid path ping payload was relayed: %#v", out)
 	}
 }
 
@@ -479,5 +531,54 @@ func TestCreateWithAuthFlagRejected(t *testing.T) {
 	}
 	if out := s.Handle(raw, addr(1)); len(out) != 0 {
 		t.Fatal("authenticated CREATE was accepted")
+	}
+}
+
+func TestJoinRejectsUnencodableRoster(t *testing.T) {
+	server, _ := newTestServer(t)
+	longName := strings.Repeat("🤝", 18)
+	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "00000001", Name: longName,
+	}, addr(1)).welcome
+	for index := 2; index <= 7; index++ {
+		join := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+			RequestID: fmt.Sprintf("%08x", index), Name: longName, RoomCode: host.RoomCode,
+		}, addr(index))
+		if join.welcome == nil {
+			t.Fatalf("member %d should fit: %+v", index, join.errMsg)
+		}
+	}
+	overflow := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000008", Name: longName, RoomCode: host.RoomCode,
+	}, addr(8))
+	if overflow.errMsg == nil || overflow.errMsg.Code != "roster_too_large" {
+		t.Fatalf("expected roster error, got %+v", overflow)
+	}
+	guest := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000009", Name: "guest", RoomCode: host.RoomCode,
+	}, addr(8)).welcome
+	if guest == nil || guest.MemberID != 9 || len(guest.Members) != 8 {
+		t.Fatalf("failed join affected the roster: %+v", guest)
+	}
+}
+
+func TestConfiguredMemberRateRefills(t *testing.T) {
+	clock := newTestClock()
+	server := New(Config{Now: clock.Now, Logger: testLogger(t), MemberPacketRate: 1})
+	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "00000001", Name: "host",
+	}, addr(1)).welcome
+	guest := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000002", Name: "guest", RoomCode: host.RoomCode,
+	}, addr(2)).welcome
+	for index, count := range []int{1, 1, 0, 1} {
+		if index == 3 {
+			clock.Advance(time.Second)
+		}
+		data := clientFrame(t, tokenOf(t, host), parseRoomID(t, host.RoomID), host.MemberID,
+			protocol.KindData, guest.MemberID, uint64(index+1), []byte("test"))
+		if out := server.Handle(data, addr(1)); len(out) != count {
+			t.Fatalf("packet %d: got %d outbound frames, want %d", index, len(out), count)
+		}
 	}
 }

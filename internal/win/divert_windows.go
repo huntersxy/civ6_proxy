@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	windivertLayerNetwork  = 0
-	windivertShutdownBoth  = 3
-	windivertPacketBufSize = 65575
-	windivertAddressSize   = 80
-	windivertBitOutbound   = 1 << 17
+	windivertLayerNetwork = 0
+	windivertFlagSniff    = 1
+	windivertFlagRecvOnly = 4
+	windivertShutdownBoth = 3
+	windivertIPChecksum   = 1 << 21
+	windivertUDPChecksum  = 1 << 23
 )
 
 // wdAddress mirrors WINDIVERT_ADDRESS from WinDivert 2.2.2 (80 bytes).
@@ -27,25 +28,12 @@ type wdAddress struct {
 	Reserved  [14]uint32
 }
 
-func (a *wdAddress) setLayer(layer uint32) {
-	a.Bits = (a.Bits &^ 0xff) | (layer & 0xff)
-}
-
-func (a *wdAddress) setOutbound(outbound bool) {
-	if outbound {
-		a.Bits |= windivertBitOutbound
-	} else {
-		a.Bits &^= windivertBitOutbound
-	}
-}
-
 type divertAPI struct {
 	open     *syscall.Proc
 	recv     *syscall.Proc
 	send     *syscall.Proc
 	shutdown *syscall.Proc
 	close    *syscall.Proc
-	setParam *syscall.Proc
 }
 
 func loadDivertAPI(dll *syscall.DLL) (*divertAPI, error) {
@@ -66,7 +54,6 @@ func loadDivertAPI(dll *syscall.DLL) (*divertAPI, error) {
 		{"WinDivertSend", &api.send},
 		{"WinDivertShutdown", &api.shutdown},
 		{"WinDivertClose", &api.close},
-		{"WinDivertSetParam", &api.setParam},
 	} {
 		proc, err := lookup(item.name)
 		if err != nil {
@@ -87,6 +74,10 @@ type DivertHandle struct {
 // OpenDivert opens a WinDivert handle with the given filter, extracting and
 // loading the embedded driver from dir.
 func OpenDivert(dir, filter string) (*DivertHandle, error) {
+	return openDivert(dir, filter, 0)
+}
+
+func openDivert(dir, filter string, flags uintptr) (*DivertHandle, error) {
 	dll, err := LoadDriver(dir)
 	if err != nil {
 		return nil, err
@@ -103,7 +94,7 @@ func OpenDivert(dir, filter string) (*DivertHandle, error) {
 		uintptr(unsafe.Pointer(filterPtr)),
 		uintptr(windivertLayerNetwork),
 		0,
-		0,
+		flags,
 	)
 	handle := uintptr(r1)
 	if handle == 0 || handle == ^uintptr(0) {
@@ -115,27 +106,21 @@ func OpenDivert(dir, filter string) (*DivertHandle, error) {
 	return &DivertHandle{api: api, handle: handle}, nil
 }
 
-// Recv blocks until one packet arrives. The returned slice aliases buf.
-func (h *DivertHandle) Recv(buf []byte) ([]byte, wdAddress, error) {
-	var addr wdAddress
-	if len(buf) == 0 {
-		return nil, addr, errors.New("empty buffer")
-	}
-	var recvLen uint32
+func (h *DivertHandle) recv(buf []byte, addr *wdAddress, recvLen *uint32) ([]byte, error) {
 	r1, _, callErr := h.api.recv.Call(
 		h.handle,
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(uint32(len(buf))),
-		uintptr(unsafe.Pointer(&recvLen)),
-		uintptr(unsafe.Pointer(&addr)),
+		uintptr(unsafe.Pointer(recvLen)),
+		uintptr(unsafe.Pointer(addr)),
 	)
 	if r1 == 0 {
-		return nil, addr, callError("WinDivertRecv", callErr)
+		return nil, callError("WinDivertRecv", callErr)
 	}
-	if recvLen > uint32(len(buf)) {
-		return nil, addr, errors.New("WinDivertRecv returned an oversized packet")
+	if *recvLen > uint32(len(buf)) {
+		return nil, errors.New("WinDivertRecv returned an oversized packet")
 	}
-	return buf[:recvLen], addr, nil
+	return buf[:*recvLen], nil
 }
 
 // Send injects one packet with the supplied address metadata.
@@ -143,12 +128,11 @@ func (h *DivertHandle) Send(packet []byte, addr *wdAddress) error {
 	if len(packet) == 0 {
 		return errors.New("empty packet")
 	}
-	var sent uint32
 	r1, _, callErr := h.api.send.Call(
 		h.handle,
 		uintptr(unsafe.Pointer(&packet[0])),
 		uintptr(uint32(len(packet))),
-		uintptr(unsafe.Pointer(&sent)),
+		0,
 		uintptr(unsafe.Pointer(addr)),
 	)
 	if r1 == 0 {

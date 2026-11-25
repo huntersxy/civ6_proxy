@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"unicode/utf8"
 )
 
 // Peer is one member entry in control messages.
@@ -57,10 +56,7 @@ type PingMessage struct {
 	SentNS int64 `json:"sent_ns"`
 }
 
-// EncodeControl serializes a control message as compact, ASCII-only JSON.
-//
-// The Python reference decodes control payloads as ASCII before parsing JSON,
-// so non-ASCII runes must be emitted as \uXXXX escapes.
+// EncodeControl serializes a control message as compact UTF-8 JSON.
 func EncodeControl(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -68,51 +64,7 @@ func EncodeControl(v any) ([]byte, error) {
 	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
-	raw := bytes.TrimSuffix(buf.Bytes(), []byte{'\n'})
-	return escapeNonASCII(raw), nil
-}
-
-func escapeNonASCII(in []byte) []byte {
-	ascii := true
-	for _, c := range in {
-		if c >= 0x80 {
-			ascii = false
-			break
-		}
-	}
-	if ascii {
-		return in
-	}
-	out := make([]byte, 0, len(in)+16)
-	for i := 0; i < len(in); {
-		c := in[i]
-		if c < 0x80 {
-			out = append(out, c)
-			i++
-			continue
-		}
-		r, size := utf8.DecodeRune(in[i:])
-		if r == utf8.RuneError && size == 1 {
-			out = append(out, c)
-			i++
-			continue
-		}
-		if r <= 0xFFFF {
-			out = appendU4(out, uint16(r))
-		} else {
-			r -= 0x10000
-			out = appendU4(out, uint16(0xD800+(r>>10)))
-			out = appendU4(out, uint16(0xDC00+(r&0x3FF)))
-		}
-		i += size
-	}
-	return out
-}
-
-func appendU4(dst []byte, v uint16) []byte {
-	const hex = "0123456789abcdef"
-	return append(dst, '\\', 'u',
-		hex[(v>>12)&0xF], hex[(v>>8)&0xF], hex[(v>>4)&0xF], hex[v&0xF])
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
 // DecodeControl parses a JSON control message.

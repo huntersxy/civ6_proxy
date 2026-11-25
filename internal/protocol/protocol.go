@@ -1,7 +1,4 @@
-// Package protocol implements the Civ6Relay v1 UDP wire format.
-//
-// The format is byte-compatible with the Python reference implementation so
-// that Go and Python clients/servers can be mixed freely.
+// Package protocol implements the Civ6Relay v2 UDP wire format.
 package protocol
 
 import (
@@ -11,14 +8,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	Magic              = "C6R1"
-	Version            = 1
+	Magic              = "C6R2"
+	Version            = 2
 	HeaderSize         = 40
 	AuthTagSize        = 16
 	MaxOuterDatagram   = 1200
@@ -42,6 +41,12 @@ const (
 	KindData       Kind = 8
 	KindError      Kind = 9
 	KindRoomClosed Kind = 10
+	KindP2PRequest Kind = 11
+	KindP2PState   Kind = 12
+	KindPeerProbe  Kind = 13
+	KindPeerAck    Kind = 14
+	KindPathPing   Kind = 15
+	KindPathPong   Kind = 16
 )
 
 func (k Kind) String() string {
@@ -66,6 +71,18 @@ func (k Kind) String() string {
 		return "ERROR"
 	case KindRoomClosed:
 		return "ROOM_CLOSED"
+	case KindP2PRequest:
+		return "P2P_REQUEST"
+	case KindP2PState:
+		return "P2P_STATE"
+	case KindPeerProbe:
+		return "PEER_PROBE"
+	case KindPeerAck:
+		return "PEER_ACK"
+	case KindPathPing:
+		return "PATH_PING"
+	case KindPathPong:
+		return "PATH_PONG"
 	default:
 		return fmt.Sprintf("KIND(%d)", uint8(k))
 	}
@@ -90,7 +107,34 @@ var (
 	ErrPayloadLength = errors.New("payload length mismatch")
 	ErrFragments     = errors.New("invalid fragment fields")
 	ErrPayloadSize   = errors.New("frame payload is too large")
+	errShortKey      = errors.New("authentication key is too short")
 )
+
+// Authenticator reuses the HMAC state for a single key. Calls must be serialized.
+type Authenticator struct {
+	mac    hash.Hash
+	digest [sha256.Size]byte
+}
+
+func NewAuthenticator(key []byte) *Authenticator {
+	return &Authenticator{mac: hmac.New(sha256.New, key)}
+}
+
+func (a *Authenticator) tag(data []byte) []byte {
+	a.mac.Reset()
+	_, _ = a.mac.Write(data)
+	return a.mac.Sum(a.digest[:0])[:AuthTagSize]
+}
+
+// Verify checks the tag of an authenticated datagram as received on the wire.
+func (a *Authenticator) Verify(datagram []byte) bool {
+	if len(datagram) < HeaderSize+AuthTagSize || len(datagram) > MaxOuterDatagram ||
+		Flags(binary.BigEndian.Uint16(datagram[6:8]))&FlagAuthenticated == 0 {
+		return false
+	}
+	tagOffset := len(datagram) - AuthTagSize
+	return hmac.Equal(a.tag(datagram[:tagOffset]), datagram[tagOffset:])
+}
 
 // Frame is one relay frame.
 type Frame struct {
@@ -129,6 +173,18 @@ func putHeader(dst []byte, f *Frame, flags Flags) {
 // Encode serializes the frame. A nil key produces an unauthenticated frame;
 // a non-nil key sets the authenticated flag and appends a 16-byte HMAC tag.
 func (f *Frame) Encode(key []byte) ([]byte, error) {
+	var authenticator *Authenticator
+	if key != nil {
+		if len(key) < 16 {
+			return nil, errShortKey
+		}
+		authenticator = NewAuthenticator(key)
+	}
+	return f.AppendEncode(nil, authenticator)
+}
+
+// AppendEncode appends a frame to dst, using spare capacity when available.
+func (f *Frame) AppendEncode(dst []byte, authenticator *Authenticator) ([]byte, error) {
 	if len(f.Payload) > MaxFragmentPayload {
 		return nil, ErrPayloadSize
 	}
@@ -140,31 +196,38 @@ func (f *Frame) Encode(key []byte) ([]byte, error) {
 		return nil, ErrFragments
 	}
 	flags := f.Flags
-	if key == nil {
+	if authenticator == nil {
 		flags &^= FlagAuthenticated
 	} else {
-		if len(key) < 16 {
-			return nil, errors.New("authentication key is too short")
-		}
 		flags |= FlagAuthenticated
 	}
-	// The 16-byte tag is always present; unauthenticated frames carry zeros.
 	size := HeaderSize + len(f.Payload) + AuthTagSize
-	out := make([]byte, size)
+	offset := len(dst)
+	dst = slices.Grow(dst, size)[:offset+size]
+	out := dst[offset:]
 	f.FragmentCount = count
 	putHeader(out[:HeaderSize], f, flags)
 	copy(out[HeaderSize:], f.Payload)
-	if key != nil {
-		mac := hmac.New(sha256.New, key)
-		mac.Write(out[:HeaderSize+len(f.Payload)])
-		tag := mac.Sum(nil)
-		copy(out[HeaderSize+len(f.Payload):], tag[:AuthTagSize])
+	tagOffset := size - AuthTagSize
+	if authenticator != nil {
+		copy(out[tagOffset:], authenticator.tag(out[:tagOffset]))
+	} else {
+		clear(out[tagOffset:])
 	}
-	return out, nil
+	return dst, nil
 }
 
 // Decode parses a datagram and copies the payload.
 func Decode(datagram []byte) (Frame, error) {
+	f, err := DecodeView(datagram)
+	if err == nil {
+		f.Payload = slices.Clone(f.Payload)
+	}
+	return f, err
+}
+
+// DecodeView parses a datagram whose payload remains backed by datagram.
+func DecodeView(datagram []byte) (Frame, error) {
 	var f Frame
 	if len(datagram) < HeaderSize+AuthTagSize {
 		return f, ErrTooShort
@@ -179,7 +242,7 @@ func Decode(datagram []byte) (Frame, error) {
 		return f, ErrVersion
 	}
 	kind := Kind(datagram[5])
-	if kind < KindCreate || kind > KindRoomClosed {
+	if kind < KindCreate || kind > KindPathPong {
 		return f, ErrKind
 	}
 	flags := Flags(binary.BigEndian.Uint16(datagram[6:8]))
@@ -192,8 +255,6 @@ func Decode(datagram []byte) (Frame, error) {
 	if count < 1 || count > MaxFragmentCount || index >= count {
 		return f, ErrFragments
 	}
-	payload := make([]byte, payloadLen)
-	copy(payload, datagram[HeaderSize:HeaderSize+payloadLen])
 	f = Frame{
 		Kind:          kind,
 		Flags:         flags,
@@ -206,7 +267,7 @@ func Decode(datagram []byte) (Frame, error) {
 		TargetPort:    binary.BigEndian.Uint16(datagram[24:26]),
 		Sequence:      binary.BigEndian.Uint64(datagram[28:36]),
 		PacketID:      binary.BigEndian.Uint32(datagram[36:40]),
-		Payload:       payload,
+		Payload:       datagram[HeaderSize : HeaderSize+payloadLen : HeaderSize+payloadLen],
 	}
 	copy(f.AuthTag[:], datagram[HeaderSize+payloadLen:])
 	return f, nil

@@ -1,30 +1,39 @@
 package relay
 
 import (
-	"net"
+	"net/netip"
 
 	"civ6relay/internal/protocol"
 )
 
-func (s *Server) handleAuthenticatedLocked(frame *protocol.Frame, addr *net.UDPAddr, datagramSize int) []Outbound {
-	r := s.roomsByID[frame.RoomID]
-	if r == nil {
-		return nil
+func (s *Server) handleAuthenticated(r *room, frame *protocol.Frame, addr netip.AddrPort, raw []byte, batch *Batch) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.member(frame.SourceMember)
+	if r.closed || m == nil || !m.auth.Verify(raw) || !m.replay.Accept(frame.Sequence) {
+		return
 	}
-	m := r.members[frame.SourceMember]
-	if m == nil {
-		return nil
-	}
-	if !frame.Verified(m.token[:]) || !m.replay.Accept(frame.Sequence) {
-		return nil
+	now := s.clock()
+	switch frame.Kind {
+	case protocol.KindPing, protocol.KindLeave, protocol.KindData, protocol.KindP2PRequest,
+		protocol.KindPathPing, protocol.KindPathPong:
+	default:
+		return
 	}
 	becameOnline := !m.online
-	m.addr = cloneAddr(addr)
-	m.lastSeen = s.clock()
+	m.addr = addr
+	m.lastSeen = now
 	m.online = true
-	var out []Outbound
 	if becameOnline {
-		out = s.peerUpdatesLocked(r)
+		s.peerUpdatesLocked(r, batch)
+	}
+	if frame.Kind == protocol.KindP2PRequest {
+		r.handleP2PLocked(m, frame, addr, len(raw), now, batch)
+		return
+	}
+	if frame.Kind == protocol.KindPathPing || frame.Kind == protocol.KindPathPong {
+		r.routePathProbeLocked(m, frame, now, batch)
+		return
 	}
 	switch frame.Kind {
 	case protocol.KindPing:
@@ -34,103 +43,89 @@ func (s *Server) handleAuthenticatedLocked(frame *protocol.Frame, addr *net.UDPA
 			SourceMember: 0,
 			Payload:      frame.Payload,
 		}
-		out = s.appendSignedLocked(out, m, pong)
+		batch.appendSigned(m, pong)
 	case protocol.KindLeave:
 		if m.isHost {
-			out = append(out, s.closeRoomLocked(r, "host_left")...)
+			s.closeRoomLocked(r, "host_left", batch)
 		} else {
-			delete(r.members, m.id)
-			out = append(out, s.peerUpdatesLocked(r)...)
+			r.members[m.id-firstMemberID] = nil
+			s.memberCount.Add(-1)
+			s.peerUpdatesLocked(r, batch)
 			s.log.Printf("member left room=%s member=%d", r.code, m.id)
 		}
 	case protocol.KindData:
-		if m.limit.allow(datagramSize, s.clock()) {
-			out = append(out, s.routeDataLocked(r, m, frame)...)
+		if m.limit.allow(len(raw), now) {
+			r.routeDataLocked(m, frame, batch)
 		}
 	}
-	return out
 }
 
-func (s *Server) routeDataLocked(r *room, sender *member, frame *protocol.Frame) []Outbound {
-	var targets []*member
-	if frame.TargetMember == broadcastMember {
-		for _, id := range r.sortedIDs() {
-			m := r.members[id]
-			if m.id != sender.id && m.online {
-				targets = append(targets, m)
-			}
-		}
-	} else {
-		m := r.members[frame.TargetMember]
-		if m != nil && m.online && m.id != sender.id {
-			targets = append(targets, m)
-		}
+func (r *room) routePathProbeLocked(sender *member, frame *protocol.Frame, now float64, batch *Batch) {
+	if frame.FragmentCount != 1 || frame.Flags&protocol.FlagBroadcast != 0 || len(frame.Payload) != 8 ||
+		frame.TargetMember < firstMemberID || frame.TargetMember > firstMemberID+maxRoomMembers-1 ||
+		frame.TargetMember == sender.id || !sender.pathLimit.allow(len(frame.Payload), now) {
+		return
 	}
-	var out []Outbound
-	for _, target := range targets {
-		forwarded := protocol.Frame{
-			Kind:          protocol.KindData,
-			Flags:         frame.Flags & (protocol.FlagBroadcast | protocol.FlagFragmented),
-			RoomID:        r.id,
-			SourceMember:  sender.id,
-			PacketID:      frame.PacketID,
-			FragmentIndex: frame.FragmentIndex,
-			FragmentCount: frame.FragmentCount,
-			SourcePort:    frame.SourcePort,
-			TargetPort:    frame.TargetPort,
-			Payload:       frame.Payload,
-		}
-		out = s.appendSignedLocked(out, target, forwarded)
+	target := r.member(frame.TargetMember)
+	if target == nil || !target.online {
+		return
 	}
-	return out
+	forwarded := protocol.Frame{
+		Kind: frame.Kind, RoomID: r.id, SourceMember: sender.id, Payload: frame.Payload,
+	}
+	batch.appendSigned(target, forwarded)
 }
 
-func (s *Server) peerUpdatesLocked(r *room) []Outbound {
+func (r *room) routeDataLocked(sender *member, frame *protocol.Frame, batch *Batch) {
+	forwarded := *frame
+	forwarded.Flags &= protocol.FlagBroadcast | protocol.FlagFragmented
+	if frame.TargetMember != broadcastMember {
+		m := r.member(frame.TargetMember)
+		if m != nil && m.online && m != sender {
+			batch.appendSigned(m, forwarded)
+		}
+		return
+	}
+	for _, m := range r.members {
+		if m != nil && m.online && m != sender {
+			batch.appendSigned(m, forwarded)
+		}
+	}
+}
+
+func (s *Server) peerUpdatesLocked(r *room, batch *Batch) {
 	payload, err := protocol.EncodeControl(protocol.PeerListMessage{Members: r.peerList()})
 	if err != nil {
-		return nil
+		return
 	}
-	var out []Outbound
-	for _, id := range r.sortedIDs() {
-		m := r.members[id]
-		if !m.online {
-			continue
+	frame := protocol.Frame{Kind: protocol.KindPeers, RoomID: r.id, Payload: payload}
+	for _, m := range r.members {
+		if m != nil && m.online {
+			batch.appendSigned(m, frame)
 		}
-		frame := protocol.Frame{
-			Kind:         protocol.KindPeers,
-			RoomID:       r.id,
-			SourceMember: 0,
-			Payload:      payload,
-		}
-		out = s.appendSignedLocked(out, m, frame)
 	}
-	return out
 }
 
-func (s *Server) closeRoomLocked(r *room, reason string) []Outbound {
-	if s.roomsByID[r.id] != r {
-		return nil
-	}
+func (s *Server) closeRoomLocked(r *room, reason string, batch *Batch) {
 	payload, err := protocol.EncodeControl(protocol.RoomClosedMessage{Reason: reason})
 	if err != nil {
-		return nil
+		return
 	}
-	var out []Outbound
-	for _, id := range r.sortedIDs() {
-		m := r.members[id]
-		if !m.online {
-			continue
+	frame := protocol.Frame{Kind: protocol.KindRoomClosed, RoomID: r.id, Payload: payload}
+	var members int64
+	for _, m := range r.members {
+		if m != nil {
+			members++
+			if m.online {
+				batch.appendSigned(m, frame)
+			}
 		}
-		frame := protocol.Frame{
-			Kind:         protocol.KindRoomClosed,
-			RoomID:       r.id,
-			SourceMember: 0,
-			Payload:      payload,
-		}
-		out = s.appendSignedLocked(out, m, frame)
 	}
+	r.closed = true
+	s.roomsMu.Lock()
 	delete(s.roomsByID, r.id)
 	delete(s.roomsByCode, r.code)
+	s.memberCount.Add(-members)
+	s.roomsMu.Unlock()
 	s.log.Printf("room closed room=%s reason=%s", r.code, reason)
-	return out
 }
