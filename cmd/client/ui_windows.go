@@ -412,7 +412,7 @@ func (u *uiWindow) runDiagnostics() {
 	enableWindow(u.hDiag, false)
 	relay := windowText(u.hRelay)
 	go func() {
-		summary, _, path, ok := collectDiagnostics(relay)
+		summary, _, path, ok := collectDiagnostics(relay, u.s.logLocation())
 		u.post(func() {
 			u.diagBusy = false
 			enableWindow(u.hDiag, true)

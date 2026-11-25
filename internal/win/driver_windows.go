@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -38,14 +39,7 @@ var loadedDriverDLL *syscall.DLL
 // EnsureDriver extracts the embedded driver files and returns the directory.
 // Existing files are left untouched when their content already matches.
 func EnsureDriver() (string, error) {
-	base := os.Getenv("ProgramData")
-	if base == "" {
-		base = os.Getenv("LOCALAPPDATA")
-	}
-	if base == "" {
-		base = os.TempDir()
-	}
-	dir := filepath.Join(base, "Civ6Relay", windivertVersionDir)
+	dir := DriverDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		// Fall back to the per-user location when ProgramData is not writable.
 		if local := os.Getenv("LOCALAPPDATA"); local != "" {
@@ -115,3 +109,103 @@ func DriverLicense() string {
 }
 
 var errDriverNotLoaded = errors.New("WinDivert 驱动未加载")
+
+// DriverDir returns the preferred directory for the extracted driver files.
+func DriverDir() string {
+	base := os.Getenv("ProgramData")
+	if base == "" {
+		base = os.Getenv("LOCALAPPDATA")
+	}
+	if base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "Civ6Relay", windivertVersionDir)
+}
+
+// FileStatus describes one extracted driver file.
+type FileStatus struct {
+	Path     string
+	Exists   bool
+	Size     int64
+	SHA256   string
+	Match    bool
+	Verified bool
+}
+
+// Describe returns a detailed one-line description including the hash.
+func (f FileStatus) Describe() string {
+	if !f.Exists {
+		return "缺失"
+	}
+	if f.SHA256 == "" {
+		return fmt.Sprintf("存在, %d 字节（无法读取/计算哈希）", f.Size)
+	}
+	if !f.Verified {
+		return fmt.Sprintf("存在, %d 字节, SHA256=%s", f.Size, f.SHA256)
+	}
+	match := "与官方一致"
+	if !f.Match {
+		match = "与官方不一致"
+	}
+	return fmt.Sprintf("存在, %d 字节, SHA256=%s, %s", f.Size, f.SHA256, match)
+}
+
+// DescribeShort omits the hash, for UI message boxes.
+func (f FileStatus) DescribeShort() string {
+	if !f.Exists {
+		return "缺失"
+	}
+	if !f.Verified {
+		return fmt.Sprintf("存在, %d 字节", f.Size)
+	}
+	if f.Match {
+		return fmt.Sprintf("存在, %d 字节, 与官方一致", f.Size)
+	}
+	return fmt.Sprintf("存在, %d 字节, 与官方不一致", f.Size)
+}
+
+// DriverStatus is a snapshot of the extracted driver files.
+type DriverStatus struct {
+	Dir      string
+	DLL      FileStatus
+	SYS      FileStatus
+	License  FileStatus
+	Complete bool
+}
+
+// InspectDriver checks the extracted files against the embedded hashes.
+func InspectDriver(dir string) DriverStatus {
+	if dir == "" {
+		dir = DriverDir()
+	}
+	expectedDLL, expectedSYS := DriverHashes()
+	status := DriverStatus{
+		Dir:     dir,
+		DLL:     inspectFile(filepath.Join(dir, windivertDLLName), &expectedDLL),
+		SYS:     inspectFile(filepath.Join(dir, windivertSYSName), &expectedSYS),
+		License: inspectFile(filepath.Join(dir, windivertLicenseName), nil),
+	}
+	status.Complete = status.DLL.Exists && status.DLL.Match && status.SYS.Exists && status.SYS.Match
+	return status
+}
+
+func inspectFile(path string, expected *[32]byte) FileStatus {
+	status := FileStatus{Path: path}
+	info, err := os.Stat(path)
+	if err != nil {
+		return status
+	}
+	status.Exists = true
+	status.Size = info.Size()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return status
+	}
+	sum := sha256.Sum256(data)
+	status.SHA256 = hex.EncodeToString(sum[:])
+	if expected != nil {
+		status.Verified = true
+		status.Match = sum == *expected
+	}
+	return status
+}

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,6 +80,8 @@ type session struct {
 	errSeq    int64
 	logSeq    int64
 	logs      []logEntry
+	logPath   string
+	logFile   *os.File
 	members   []protocol.Peer
 
 	quitting    bool
@@ -85,12 +90,93 @@ type session struct {
 }
 
 func newSession(capture bool) *session {
-	return &session{
+	s := &session{
 		capture:   capture,
 		status:    "未连接",
 		relayHost: "127.0.0.1",
 		relayPort: defaultRelayPort,
 	}
+	s.openLog()
+	if s.logPath == "" {
+		s.logAt("WARN", "无法创建日志文件，请检查 %LOCALAPPDATA% 权限")
+	} else {
+		s.logAt("INFO", "日志文件: "+s.logPath)
+	}
+	return s
+}
+
+func (s *session) openLog() {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "Civ6Relay", "logs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "client-"+time.Now().Format("20060102")+".log")
+	needBOM := true
+	if info, err := os.Stat(path); err == nil {
+		needBOM = info.Size() == 0
+		missingBOM := false
+		if info.Size() >= 3 {
+			if f, err := os.Open(path); err == nil {
+				var head [3]byte
+				_, _ = f.Read(head[:])
+				missingBOM = !(head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF)
+				_ = f.Close()
+			}
+		}
+		if info.Size() > 5<<20 || missingBOM {
+			_ = os.Remove(path + ".1")
+			_ = os.Rename(path, path+".1")
+			needBOM = true
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	if needBOM {
+		_, _ = f.Write([]byte{0xEF, 0xBB, 0xBF})
+	}
+	s.logFile = f
+	s.logPath = path
+}
+
+// CloseLog flushes and closes the automatic log file.
+func (s *session) CloseLog() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logFile != nil {
+		_ = s.logFile.Close()
+		s.logFile = nil
+	}
+}
+
+func (s *session) logLocation() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logPath == "" {
+		return "未创建（请检查 %LOCALAPPDATA% 权限）"
+	}
+	return s.logPath
+}
+
+// logEnvironment writes startup facts that support needs when diagnosing.
+func (s *session) logEnvironment() {
+	exe, _ := os.Executable()
+	s.logInfo("Civ6RelayClient %s 启动", version)
+	s.logInfo("系统: %s, 管理员: %v, 抓包: %v", win.OSVersion(), win.IsAdmin(), s.capture)
+	s.logInfo("程序: %s", exe)
+	s.logInfo("配置: %s", configPath())
+	s.logInfo("日志: %s", s.logLocation())
+	if av := win.SecuritySoftware(); len(av) > 0 {
+		s.logWarn("检测到安全软件: %s", strings.Join(av, "、"))
+	}
+	svc := win.QueryWinDivertService()
+	s.logInfo("WinDivert 服务: %s", svc.Summary())
+	s.logInfo("驱动目录: %s", win.DriverDir())
 }
 
 func (s *session) setConfig(cfg Config) {
@@ -102,12 +188,20 @@ func (s *session) setConfig(cfg Config) {
 }
 
 func (s *session) logAt(level, message string) {
+	now := time.Now()
 	s.mu.Lock()
 	s.logSeq++
-	entry := logEntry{Seq: s.logSeq, Time: time.Now().Format("15:04:05"), Level: level, Message: message}
+	entry := logEntry{Seq: s.logSeq, Time: now.Format("15:04:05"), Level: level, Message: message}
 	s.logs = append(s.logs, entry)
 	if len(s.logs) > 500 {
 		s.logs = s.logs[len(s.logs)-500:]
+	}
+	if s.logFile != nil {
+		text := message
+		if strings.Contains(text, "\n") {
+			text = strings.ReplaceAll(text, "\n", "\n    ")
+		}
+		fmt.Fprintf(s.logFile, "%s [%s] %s\n", now.Format("2006-01-02 15:04:05"), level, text)
 	}
 	s.mu.Unlock()
 }
@@ -218,7 +312,22 @@ func (s *session) connectWorker(mode, host string, port int, name, code string) 
 		driverDir, derr := win.EnsureDriver()
 		if derr != nil {
 			client.Disconnect()
-			s.failConnect(fmt.Errorf("释放 WinDivert 驱动失败: %w", derr))
+			s.failConnect(fmt.Errorf("释放 WinDivert 驱动失败: %w\n驱动目录: %s\n日志: %s", derr, win.DriverDir(), s.logLocation()))
+			return
+		}
+		status := win.InspectDriver(driverDir)
+		s.logInfo("驱动目录: %s", driverDir)
+		s.logInfo("WinDivert64.dll: %s", status.DLL.Describe())
+		s.logInfo("WinDivert64.sys: %s", status.SYS.Describe())
+		svc := win.QueryWinDivertService()
+		s.logInfo("WinDivert 服务: %s", svc.Summary())
+		av := win.SecuritySoftware()
+		if len(av) > 0 {
+			s.logWarn("检测到安全软件: %s", strings.Join(av, "、"))
+		}
+		if !status.Complete {
+			client.Disconnect()
+			s.failConnect(errors.New(s.driverIncompleteText(status)))
 			return
 		}
 		bridge, err = win.StartBridge(client, subnet, route, driverDir, func(level, message string) {
@@ -226,7 +335,7 @@ func (s *session) connectWorker(mode, host string, port int, name, code string) 
 		})
 		if err != nil {
 			client.Disconnect()
-			s.failConnect(fmt.Errorf("启动 WinDivert 失败: %w\n驱动目录: %s\n如果杀毒软件拦截了 WinDivert64.sys，请把该目录加入信任后重试。", err, driverDir))
+			s.failConnect(errors.New(s.driverFailureText(err, driverDir)))
 			return
 		}
 	}
@@ -401,6 +510,7 @@ func (s *session) Shutdown() {
 	client, bridge := s.client, s.bridge
 	s.client, s.bridge = nil, nil
 	s.mu.Unlock()
+	s.logInfo("正在退出，停止会话…")
 	if bridge != nil {
 		bridge.Stop()
 	}

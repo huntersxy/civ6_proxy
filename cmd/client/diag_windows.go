@@ -3,22 +3,23 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"civ6relay/internal/win"
 )
 
-// collectDiagnostics gathers driver, network and firewall facts, writes a
-// report to %TEMP%\Civ6RelayDiag.txt, and returns a short summary.
-func collectDiagnostics(relayText string) (summary, report, reportPath string, ok bool) {
+// collectDiagnostics gathers driver, security software, service, Defender,
+// network and firewall facts, writes a report to %TEMP%\Civ6RelayDiag.txt and
+// returns a short summary.
+func collectDiagnostics(relayText, logPath string) (summary, report, reportPath string, ok bool) {
 	ok = true
 	var b strings.Builder
 	var status []string
@@ -34,61 +35,82 @@ func collectDiagnostics(relayText string) (summary, report, reportPath string, o
 	line("时间: %s", time.Now().Format("2006-01-02 15:04:05"))
 	line("版本: %s", version)
 	line("平台: %s/%s", runtime.GOOS, runtime.GOARCH)
+	line("系统: %s", win.OSVersion())
 	admin := win.IsAdmin()
 	line("管理员权限: %v", admin)
+	if logPath == "" {
+		logPath = "%LOCALAPPDATA%\\Civ6Relay\\logs（仅 GUI 模式生成）"
+	}
+	line("自动日志: %s", logPath)
+	status = append(status, fmt.Sprintf("系统: %s", win.OSVersion()))
 	status = append(status, fmt.Sprintf("管理员权限: %v", admin))
 
 	line("")
-	line("== 1. 驱动文件 ==")
+	line("== 1. 安全软件 ==")
+	av := win.SecuritySoftware()
+	if len(av) == 0 {
+		line("未检测到常见安全软件进程")
+		status = append(status, "安全软件: 未检测到")
+	} else {
+		for _, item := range av {
+			line("检测到: %s", item)
+		}
+		status = append(status, "安全软件: "+strings.Join(av, "、"))
+	}
+
+	line("")
+	line("== 2. 驱动文件 ==")
 	driverDir, err := win.EnsureDriver()
+	var files win.DriverStatus
 	if err != nil {
 		fail("释放驱动文件: %v", err)
-		status = append(status, "驱动文件: 失败")
+		files = win.InspectDriver(win.DriverDir())
+		status = append(status, "驱动文件: 释放失败")
 	} else {
-		line("目录: %s", driverDir)
-		expectedDLL, expectedSYS := win.DriverHashes()
-		filesOK := true
-		for _, item := range []struct {
-			name     string
-			expected [32]byte
-		}{
-			{"WinDivert64.dll", expectedDLL},
-			{"WinDivert64.sys", expectedSYS},
-		} {
-			path := filepath.Join(driverDir, item.name)
-			data, err := os.ReadFile(path)
-			if err != nil {
-				filesOK = false
-				line("%s: 缺失 (%v)", item.name, err)
-				continue
-			}
-			actual := sha256.Sum256(data)
-			match := actual == item.expected
-			if !match {
-				filesOK = false
-			}
-			line("%s: %d 字节, sha256=%s, 匹配=%v", item.name, len(data), hex.EncodeToString(actual[:8]), match)
-		}
-		if filesOK {
-			status = append(status, "驱动文件: 完整")
+		files = win.InspectDriver(driverDir)
+		line("目录: %s", files.Dir)
+		line("WinDivert64.dll: %s", files.DLL.Describe())
+		line("WinDivert64.sys: %s", files.SYS.Describe())
+		line("许可证: %s", files.License.Describe())
+		if files.Complete {
+			status = append(status, "驱动文件: 完整且哈希匹配")
 		} else {
 			ok = false
-			status = append(status, "驱动文件: 异常")
+			status = append(status, "驱动文件: 缺失或哈希不一致")
+			line("判断: 驱动文件不完整，通常是杀毒软件隔离/删除了文件。")
+			line(avHint(av))
 		}
 	}
 
 	line("")
-	line("== 2. 驱动加载 ==")
+	line("== 3. WinDivert 服务 ==")
+	svc := win.QueryWinDivertService()
+	line("服务: %s", svc.Summary())
+	if svc.Exists {
+		line("ImagePath: %s", svc.ImagePath)
+		line("ImagePath 文件存在: %v", svc.ImageExists)
+		if !svc.ImageExists {
+			line("判断: 服务残留且指向不存在的文件；管理员执行 sc.exe stop WinDivert 和 sc.exe delete WinDivert 后重试。")
+		}
+		if svc.External() {
+			line("提示: 该服务由其他程序安装（ImagePath 不在系统驱动目录，也不在我们的驱动目录）。多个程序共用 WinDivert 服务时可能出现驱动版本冲突；如反复失败，先退出占用它的程序再重试。")
+		}
+	}
+	status = append(status, "WinDivert 服务: "+svc.Summary())
+
+	line("")
+	line("== 4. 驱动加载 ==")
 	if driverDir != "" {
 		if _, err := win.LoadDriver(driverDir); err != nil {
 			fail("LoadLibrary: %v", err)
-			status = append(status, "驱动加载: 失败")
+			status = append(status, "驱动加载: LoadLibrary 失败")
+			line(driverErrorHint(errnoOf(err), files, svc, av))
 		} else {
 			line("LoadLibrary: 成功")
 			if err := win.TestDriver(driverDir); err != nil {
 				fail("WinDivertOpen: %v", err)
 				status = append(status, "驱动加载: WinDivertOpen 失败")
-				line("提示: WinError 2 / 找不到文件通常表示 WinDivert64.sys 被杀毒软件隔离，或系统里残留了指向已删除文件的 WinDivert 服务。")
+				line(driverErrorHint(errnoOf(err), files, svc, av))
 			} else {
 				line("WinDivertOpen(\"false\") / Close: 成功")
 				status = append(status, "驱动加载: 成功")
@@ -97,7 +119,45 @@ func collectDiagnostics(relayText string) (summary, report, reportPath string, o
 	}
 
 	line("")
-	line("== 3. 网络 ==")
+	line("== 5. Defender 隔离与排除项 ==")
+	def := win.QueryDefender()
+	if def.Error != "" {
+		line("查询失败: %s", def.Error)
+		status = append(status, "Defender: 查询失败")
+	} else {
+		matches := 0
+		for _, item := range def.Quarantine {
+			lower := strings.ToLower(item)
+			if strings.Contains(lower, "windivert") || strings.Contains(lower, "civ6relay") {
+				matches++
+				if matches <= 5 {
+					line("隔离记录: %s", item)
+				}
+			}
+		}
+		if matches == 0 {
+			line("未发现 WinDivert/Civ6Relay 相关隔离记录")
+		} else {
+			line("共发现 %d 条相关隔离记录", matches)
+		}
+		excluded := false
+		for _, item := range def.Exclusions {
+			line("排除项: %s", item)
+			lower := strings.ToLower(item)
+			if strings.Contains(lower, "civ6relay") || strings.Contains(lower, "windivert") {
+				excluded = true
+			}
+		}
+		if !excluded {
+			line("驱动目录不在 Defender 排除项中（需要手动添加）")
+		} else {
+			line("驱动目录已在 Defender 排除项中")
+		}
+		status = append(status, fmt.Sprintf("Defender: 隔离记录 %d 条, 已排除=%v", matches, excluded))
+	}
+
+	line("")
+	line("== 6. 网络 ==")
 	host, port, err := parseRelayAddress(relayText)
 	if err != nil {
 		line("中转地址未配置或无效: %v", err)
@@ -135,7 +195,7 @@ func collectDiagnostics(relayText string) (summary, report, reportPath string, o
 	}
 
 	line("")
-	line("== 4. 防火墙 ==")
+	line("== 7. 防火墙 ==")
 	if win.FirewallRuleExists() {
 		line("Civ6Relay-Game-Inbound: 已存在")
 		status = append(status, "防火墙规则: 已存在")
@@ -145,15 +205,17 @@ func collectDiagnostics(relayText string) (summary, report, reportPath string, o
 	}
 
 	line("")
-	line("== 5. 结论 ==")
+	line("== 8. 结论 ==")
 	if ok {
 		line("WinDivert 驱动加载正常，可以尝试连接房间。")
 	} else {
-		line("存在失败项，请根据上面的错误处理；如为杀毒软件拦截，请把驱动目录加入信任后重试。")
+		line("存在失败项，请按上面的提示处理；如果是杀软拦截，先在隔离区恢复文件再把驱动目录加入信任。")
 	}
+	line("自动日志: %s", logPath)
 
 	reportPath = filepath.Join(os.TempDir(), "Civ6RelayDiag.txt")
-	_ = os.WriteFile(reportPath, []byte(b.String()), 0o644)
+	content := append([]byte{0xEF, 0xBB, 0xBF}, []byte(b.String())...)
+	_ = os.WriteFile(reportPath, content, 0o644)
 	summary = strings.Join(status, "\n")
 	if ok {
 		summary += "\n\n诊断通过：WinDivert 驱动可以正常加载。"
@@ -163,9 +225,17 @@ func collectDiagnostics(relayText string) (summary, report, reportPath string, o
 	return summary, b.String(), reportPath, ok
 }
 
+func errnoOf(err error) uint32 {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return uint32(errno)
+	}
+	return 0
+}
+
 func runDiagStandalone() {
 	cfg := loadConfig()
-	summary, _, path, ok := collectDiagnostics(win.FormatRelay(cfg.RelayHost, cfg.RelayPort))
+	summary, _, path, ok := collectDiagnostics(win.FormatRelay(cfg.RelayHost, cfg.RelayPort), "")
 	icon := uint32(mbIconInformation)
 	if !ok {
 		icon = mbIconError

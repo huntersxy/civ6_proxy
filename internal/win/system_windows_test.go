@@ -64,3 +64,11 @@ func TestDriverExtractAndLoad(t *testing.T) {
 		t.Fatalf("missing exports: %v", err)
 	}
 }
+
+func TestListProcesses(t *testing.T) {
+	procs := listProcesses()
+	if len(procs) < 10 {
+		t.Fatalf("expected many processes, got %d", len(procs))
+	}
+	_ = SecuritySoftware()
+}

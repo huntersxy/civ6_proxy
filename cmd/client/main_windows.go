@@ -55,9 +55,13 @@ func main() {
 	cfg := loadConfig()
 	s := newSession(!*noCapture)
 	s.setConfig(cfg)
+	s.logEnvironment()
+	defer s.CloseLog()
 	if err := runNativeUI(s, cfg); err != nil {
+		s.logError("创建主窗口失败: %v", err)
 		messageBox("启动失败", fmt.Sprintf("无法创建窗口: %v", err), mbOK|mbIconError)
 	}
+	s.logInfo("程序退出")
 }
 
 func messageBox(title, text string, flags uint32) {

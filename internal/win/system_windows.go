@@ -3,13 +3,16 @@
 package win
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -242,8 +245,8 @@ type Process struct {
 	Name string
 }
 
-// FindCiv6Processes lists CivilizationVI.exe processes using Toolhelp32.
-func FindCiv6Processes() []Process {
+// listProcesses returns all running process names using Toolhelp32.
+func listProcesses() []Process {
 	const (
 		th32csSnapProcess = 0x00000002
 		invalidHandle     = ^uintptr(0)
@@ -276,15 +279,23 @@ func FindCiv6Processes() []Process {
 	var procs []Process
 	r, _, _ := process32First.Call(snap, uintptr(unsafe.Pointer(&entry)))
 	for r != 0 {
-		name := syscall.UTF16ToString(entry.ExeFile[:])
-		lower := strings.ToLower(name)
-		if lower == "civilizationvi.exe" || lower == "civilizationvi_dx12.exe" {
-			procs = append(procs, Process{PID: entry.ProcessID, Name: name})
-		}
+		procs = append(procs, Process{PID: entry.ProcessID, Name: syscall.UTF16ToString(entry.ExeFile[:])})
 		entry.Size = uint32(unsafe.Sizeof(entry))
 		r, _, _ = process32Next.Call(snap, uintptr(unsafe.Pointer(&entry)))
 	}
 	return procs
+}
+
+// FindCiv6Processes lists CivilizationVI.exe processes.
+func FindCiv6Processes() []Process {
+	var out []Process
+	for _, p := range listProcesses() {
+		lower := strings.ToLower(p.Name)
+		if lower == "civilizationvi.exe" || lower == "civilizationvi_dx12.exe" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // FirewallRuleExists reports whether the Civ6Relay inbound rule is present.
@@ -311,5 +322,201 @@ func runHiddenOutput(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// SecuritySoftware detects common Chinese security products and Defender.
+// The returned strings include the matched process name for logs.
+func SecuritySoftware() []string {
+	detected := make(map[string]string)
+	for _, p := range listProcesses() {
+		lower := strings.ToLower(p.Name)
+		switch {
+		case strings.HasPrefix(lower, "hips"):
+			detected["火绒"] = p.Name
+		case strings.HasPrefix(lower, "360") || lower == "zhudongfangyu.exe":
+			detected["360 安全卫士"] = p.Name
+		case strings.HasPrefix(lower, "qqpc") || strings.HasPrefix(lower, "qqpcmgr"):
+			detected["腾讯电脑管家"] = p.Name
+		case lower == "msmpeng.exe":
+			detected["Microsoft Defender"] = p.Name
+		case strings.HasPrefix(lower, "kxe"):
+			detected["金山毒霸"] = p.Name
+		}
+	}
+	dirs := []struct {
+		name string
+		path []string
+	}{
+		{"火绒", []string{`C:\Program Files\Huorong\Sysdiag`, `C:\Program Files (x86)\Huorong\Sysdiag`}},
+		{"360 安全卫士", []string{`C:\Program Files\360\360Safe`, `C:\Program Files (x86)\360\360Safe`}},
+		{"腾讯电脑管家", []string{`C:\Program Files\Tencent\QQPCMgr`, `C:\Program Files (x86)\Tencent\QQPCMgr`}},
+	}
+	for _, item := range dirs {
+		if _, exists := detected[item.name]; exists {
+			continue
+		}
+		for _, path := range item.path {
+			if _, err := os.Stat(path); err == nil {
+				detected[item.name] = ""
+				break
+			}
+		}
+	}
+	order := []string{"火绒", "360 安全卫士", "腾讯电脑管家", "Microsoft Defender", "金山毒霸"}
+	var out []string
+	for _, name := range order {
+		if proc, ok := detected[name]; ok {
+			if proc != "" {
+				out = append(out, name+" ("+proc+")")
+			} else {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+type osVersionInfoW struct {
+	Size     uint32
+	Major    uint32
+	Minor    uint32
+	Build    uint32
+	Platform uint32
+	CSD      [128]uint16
+}
+
+// OSVersion returns the Windows version using RtlGetVersion.
+func OSVersion() string {
+	ntdll := syscall.NewLazyDLL("ntdll.dll")
+	proc := ntdll.NewProc("RtlGetVersion")
+	var info osVersionInfoW
+	info.Size = uint32(unsafe.Sizeof(info))
+	r, _, _ := proc.Call(uintptr(unsafe.Pointer(&info)))
+	if uint32(r) == 0 {
+		return fmt.Sprintf("Windows %d.%d.%d", info.Major, info.Minor, info.Build)
+	}
+	return "Windows (unknown)"
+}
+
+// WinDivertService describes the installed WinDivert kernel service.
+type WinDivertService struct {
+	Exists      bool
+	State       string
+	ImagePath   string
+	ImageExists bool
+	Output      string
+}
+
+// QueryWinDivertService inspects the WinDivert service and its driver path.
+func QueryWinDivertService() WinDivertService {
+	var svc WinDivertService
+	out, err := runHiddenOutput("sc.exe", "qc", "WinDivert")
+	svc.Output = strings.TrimSpace(out)
+	if err != nil {
+		return svc
+	}
+	svc.Exists = true
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToUpper(line), "BINARY_PATH_NAME") {
+			if idx := strings.Index(line, ":"); idx >= 0 {
+				path := strings.TrimSpace(line[idx+1:])
+				path = strings.TrimPrefix(path, `\??\`)
+				svc.ImagePath = path
+			}
+		}
+	}
+	if svc.ImagePath != "" {
+		if _, err := os.Stat(svc.ImagePath); err == nil {
+			svc.ImageExists = true
+		}
+	}
+	if qout, err := runHiddenOutput("sc.exe", "query", "WinDivert"); err == nil {
+		for _, line := range strings.Split(qout, "\n") {
+			if strings.Contains(line, "STATE") {
+				svc.State = strings.TrimSpace(line)
+				break
+			}
+		}
+	}
+	return svc
+}
+
+// External reports whether the service's driver lives outside the standard
+// Windows driver directory and our extracted driver directory. That usually
+// means another application installed its own WinDivert build.
+func (s WinDivertService) External() bool {
+	if !s.Exists || s.ImagePath == "" {
+		return false
+	}
+	lower := strings.ToLower(filepath.Clean(s.ImagePath))
+	system := strings.ToLower(filepath.Clean(os.Getenv("SystemRoot") + `\System32\drivers`))
+	ours := strings.ToLower(filepath.Clean(DriverDir()))
+	return !strings.HasPrefix(lower, system+`\`) && !strings.HasPrefix(lower, ours+`\`)
+}
+
+// Summary formats the service state for logs and diagnostics.
+func (s WinDivertService) Summary() string {
+	if !s.Exists {
+		return "未安装"
+	}
+	path := s.ImagePath
+	if path == "" {
+		path = "未知"
+	}
+	file := "文件存在"
+	if !s.ImageExists {
+		file = "文件缺失"
+	}
+	state := s.State
+	if state == "" {
+		state = "状态未知"
+	}
+	return fmt.Sprintf("%s；ImagePath=%s（%s）", state, path, file)
+}
+
+// DefenderInfo is the result of querying Defender quarantine and exclusions.
+type DefenderInfo struct {
+	Queried    bool
+	Quarantine []string
+	Exclusions []string
+	Error      string
+}
+
+// QueryDefender reads Defender detection history and configured exclusions.
+func QueryDefender() DefenderInfo {
+	script := `$ErrorActionPreference='SilentlyContinue'; ` +
+		`Get-MpThreatDetection | Sort-Object InitialDetectionTime -Descending | Select-Object -First 20 | ForEach-Object { 'DET|' + (($_.Resources) -join ';') }; ` +
+		`(Get-MpPreference).ExclusionPath | ForEach-Object { 'EXC|' + $_ }`
+	out, err := runHiddenOutputTimeout(10*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	info := DefenderInfo{Queried: true}
+	if err != nil {
+		info.Error = err.Error()
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "DET|") {
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "DET|")); value != "" {
+				info.Quarantine = append(info.Quarantine, value)
+			}
+		} else if strings.HasPrefix(line, "EXC|") {
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "EXC|")); value != "" {
+				info.Exclusions = append(info.Exclusions, value)
+			}
+		}
+	}
+	return info
+}
+
+func runHiddenOutputTimeout(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("命令超时 (%s)", timeout)
+	}
 	return string(out), err
 }

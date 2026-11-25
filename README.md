@@ -115,6 +115,20 @@ sudo systemctl restart civ6relay
 -version       显示版本
 ```
 
+### 杀软误报与日志（火绒 / 360 / 腾讯管家 / Defender）
+
+客户端使用官方 WinDivert 2.2.2-A：`WinDivert64.sys` 有有效签名，`WinDivert64.dll` 没有签名。火绒、360、腾讯管家、Defender 常把 WinDivert 误报为 HackTool，典型现象是驱动文件在释放后被隔离，客户端报 `WinError 2` 或 `WinError 5`。
+
+- **自动日志**：`%LOCALAPPDATA%\Civ6Relay\logs\client-YYYYMMDD.log`（UTF-8 BOM）。启动环境、管理员状态、检测到的安全软件、驱动文件哈希、WinDivert 服务 ImagePath、连接/驱动错误都会写进去；错误弹窗底部也会显示日志路径。
+- **诊断报告**：界面「诊断」或 `Civ6RelayClient.exe -diag` 生成 `%TEMP%\Civ6RelayDiag.txt`，包含驱动哈希、服务状态/ImagePath、AV 检测、Defender 隔离记录与排除项、网络和防火墙检查。
+- **火绒**：防护中心 → 隔离区恢复 `WinDivert64.dll` / `WinDivert64.sys`；安全设置 → 信任区添加 `C:\ProgramData\Civ6Relay` 和 `Civ6RelayClient.exe`；重启客户端。
+- **360 / 腾讯管家 / Defender**：在各自隔离区恢复文件，把驱动目录加入信任/排除项后重启客户端。
+- 官方哈希（与 reqrypt.org 2.2.2-A 一致）：
+  - `WinDivert64.dll` `c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2`
+  - `WinDivert64.sys` `8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2`
+- 如果系统里已有其它程序安装的 WinDivert 服务（`ImagePath` 指向别的软件目录），可能与当前 DLL 版本冲突；诊断报告和错误弹窗会明确标出。
+- 反馈问题时请附上自动日志和诊断报告。日志可能包含中转地址、昵称、房间码，公开前请自行检查。
+
 ## 兼容性说明
 
 协议层与上游 `Dts0/civ6_proxy` v1 完全一致：
