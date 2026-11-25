@@ -29,4 +29,8 @@ jobs:
         run: go build -trimpath -ldflags "-s -w" -o civ6relay-server ./cmd/server
       - name: Build client
         if: runner.os == 'Windows'
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
         run: go build -trimpath -ldflags "-s -w -H windowsgui" -o Civ6RelayClient.exe ./cmd/client
