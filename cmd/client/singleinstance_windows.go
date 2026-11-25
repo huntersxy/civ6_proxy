@@ -29,10 +29,9 @@ func acquireSingleInstance() bool {
 
 // focusExistingWindow brings the already running client to the foreground.
 func focusExistingWindow() {
-	className, _ := syscall.UTF16PtrFromString(uiClassName)
 	title, _ := syscall.UTF16PtrFromString(uiTitle)
 	for i := 0; i < 10; i++ {
-		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(title)))
+		hwnd, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(title)))
 		if hwnd != 0 {
 			procShowWindow.Call(hwnd, swShowNormal)
 			procSetForegroundWindow.Call(hwnd)

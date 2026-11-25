@@ -766,6 +766,17 @@ func (s *session) Snapshot() sessionSnapshot {
 	return snap
 }
 
+func (s *session) logEntries(knownSeq int64) ([]logEntry, int64, bool) {
+	s.mu.Lock()
+	if s.logSeq == knownSeq {
+		s.mu.Unlock()
+		return nil, knownSeq, false
+	}
+	entries, seq := append([]logEntry(nil), s.logs...), s.logSeq
+	s.mu.Unlock()
+	return entries, seq, true
+}
+
 func (s *session) logSnapshot(knownSeq int64) (string, int64) {
 	s.mu.Lock()
 	if s.logSeq == knownSeq {

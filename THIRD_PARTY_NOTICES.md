@@ -17,6 +17,13 @@ extracted binaries.
 Source code for WinDivert is available from the upstream project. Users may
 replace the extracted DLL/SYS with their own builds of the same version.
 
+## Go-Gui
+
+- Project: https://github.com/go-gui-org/go-gui
+- License: MIT
+- Used by `cmd/client` to render the native CGO-free desktop GUI (along with its
+  transitive pure-Go dependencies such as `go-glyph`, `purego`, and `golang.org/x`).
+
 ## Build-time only
 
 `github.com/akavel/rsrc` (MIT) was used once to generate
