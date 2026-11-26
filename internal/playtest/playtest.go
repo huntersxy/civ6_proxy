@@ -31,12 +31,35 @@ const (
 	discoverySourcePort = 49152
 	findAttempts        = 5
 	updateEvery         = 400 * time.Millisecond
+
+	// Sizes calibrated from a 4h14m real Civilization VI LAN capture:
+	// 86.9% of host outbound datagrams are 1180 B, max observed is 1399 B,
+	// heartbeats are 12 B with 14 B replies, and reverse traffic is dominated
+	// by 14 B ACKs at ~80% of the outbound packet rate.
+	heartbeatSize     = 12
+	ackSize           = 14
+	steadyHostSize    = 74
+	steadyGuestSize   = 90
+	civSyncSize       = 1180
+	civMaxFragSize    = 1399
+	discoveryFindSize = 16
+	discoveryReplySz  = 1104
 )
 
 var ErrRoomClosed = errors.New("simulation room closed during the test")
 
 type profile struct {
-	handshake, discoveryTick, discoveryWait, playTime, gameTick, settle time.Duration
+	handshake        time.Duration
+	discoveryTick    time.Duration
+	discoveryWait    time.Duration
+	playTime         time.Duration
+	gameTick         time.Duration
+	settle           time.Duration
+	cycleSlots       int // total ticks per steady+sync cycle
+	syncStartSlot    int // tick offset within cycle when sync burst starts
+	syncBurstPerTick int // 1180 B packets sent by host per sync tick
+	probeEverySlots  int // heartbeat RTT probe cadence (ticks)
+	fragEverySync    int // emit one incompressible >1224 B packet every N sync ticks
 }
 
 type side uint8
@@ -57,6 +80,8 @@ const (
 	command
 	ack
 	syncData
+	syncFrag
+	syncAck
 )
 
 type sendStatus uint8
@@ -98,16 +123,30 @@ type simulation struct {
 	phaseStart                  time.Time
 	phaseDuration, create, join time.Duration
 
-	mu      sync.Mutex
-	packets []datagram
+	mu              sync.Mutex
+	packets         []datagram
+	syncTickCount   int
+	syncRecvCount   int
+	hostWireAtStart uint64
 }
 
-// Run simulates a two-player match through the configured relay without using
-// the Windows bridge or sending any local game traffic.
+// Run simulates a two-player Civilization VI match through the configured relay
+// using traffic shapes calibrated from real LAN captures (12 B/14 B heartbeats,
+// sustained 1180 B ~45%-compressible turn-sync bursts at ~4.7 Mbps / 500 pps,
+// 14 B reverse ACK streams at ~400 pps, plus periodic 1399 B fragmented checks).
 func Run(ctx context.Context, address string, update func(Result)) (Result, error) {
 	return run(ctx, address, profile{
-		handshake: 5 * time.Second, discoveryTick: 320 * time.Millisecond, discoveryWait: time.Second,
-		playTime: 30 * time.Second, gameTick: 120 * time.Millisecond, settle: protocol.ReassemblyTimeout,
+		handshake:        5 * time.Second,
+		discoveryTick:    320 * time.Millisecond,
+		discoveryWait:    time.Second,
+		playTime:         30 * time.Second,
+		gameTick:         20 * time.Millisecond, // 50 ticks/s
+		settle:           protocol.ReassemblyTimeout,
+		cycleSlots:       750, // 15 s cycle (5 s steady + 10 s sync), 2 cycles in 30 s
+		syncStartSlot:    250, // sync during [5 s, 15 s) and [20 s, 30 s)
+		syncBurstPerTick: 10,  // 500 pkt/s * 1180 B = 4.72 Mbps raw game rate
+		probeEverySlots:  10,  // 200 ms heartbeat cadence
+		fragEverySync:    25,  // 2 fragmented 1399 B checks per second during sync
 	}, update)
 }
 
@@ -126,12 +165,13 @@ func run(ctx context.Context, address string, profile profile, update func(Resul
 	err = test.play(host, port)
 	cutoff := time.Now()
 	cancel()
+	res := test.snapshot(cutoff)
 	for _, endpoint := range []side{guestSide, hostSide} {
 		if client := test.clients[endpoint]; client != nil {
 			client.Disconnect()
 		}
 	}
-	return test.snapshot(cutoff), err
+	return res, err
 }
 
 func (test *simulation) play(host string, port int) error {
@@ -155,11 +195,16 @@ func (test *simulation) play(host string, port int) error {
 	config := test.profile
 	if err := test.pace(Discovering, (findAttempts-1)*config.discoveryTick+config.discoveryWait, config.discoveryTick, func(slot int) {
 		if slot < findAttempts {
-			test.send(guestSide, find, 16, 0, false)
+			test.send(guestSide, find, discoveryFindSize, 0, false)
 		}
 	}); err != nil {
 		return err
 	}
+	test.mu.Lock()
+	if c := test.clients[hostSide]; c != nil {
+		test.hostWireAtStart = c.Metrics().TunnelTxBytes
+	}
+	test.mu.Unlock()
 	if err := test.pace(Playing, config.playTime, config.gameTick, test.playTick); err != nil {
 		return err
 	}
@@ -212,6 +257,8 @@ func (test *simulation) pace(phase Phase, duration, tick time.Duration, send fun
 			return nil
 		}
 		if slot := int(elapsed / tick); send != nil && slot > lastSlot {
+			// Cap catch-up to one tick so brief scheduler stalls do not dump
+			// multiple burst ticks back-to-back.
 			send(slot)
 			lastSlot = slot
 		}
@@ -228,19 +275,36 @@ func (test *simulation) pace(phase Phase, duration, tick time.Duration, send fun
 }
 
 func (test *simulation) playTick(slot int) {
-	test.send(hostSide, state, 180, 0, false)
-	if slot%3 == 0 {
-		test.send(guestSide, state, 104, 0, false)
+	cfg := test.profile
+	cycle := slot % max(1, cfg.cycleSlots)
+	inSync := cycle >= cfg.syncStartSlot
+
+	// Periodic 12 B heartbeat probe (echoed as 14 B by peer) measures RTT in
+	// both steady state and turn-sync bursts, matching Civ 6's real probes.
+	if slot%max(1, cfg.probeEverySlots) == 0 {
+		test.send(hostSide, command, heartbeatSize, 0, inSync)
 	}
-	cycle := slot % 50
-	inSync := cycle >= 25 && cycle < 30
-	if inSync {
-		for _, size := range []int{640, 1580, 3120} {
-			test.send(hostSide, syncData, size, 0, true)
+
+	if !inSync {
+		// Idle/steady turn: low-rate 74 B / 90 B gameplay updates (~4-6 pkt/s).
+		if slot%12 == 3 {
+			test.send(hostSide, state, steadyHostSize, 0, false)
 		}
+		if slot%25 == 7 {
+			test.send(guestSide, state, steadyGuestSize, 0, false)
+		}
+		return
 	}
-	if slot%2 == 0 {
-		test.send(side(slot/2%2), command, 212, 0, inSync)
+
+	// Turn-sync burst: sustained 1180 B datagrams with Civ 6-like ~45%
+	// compressed ratio (~4.7 Mbps raw / ~500 pps), plus periodic incompressible
+	// 1399 B datagrams to exercise wire fragmentation.
+	for i := 0; i < cfg.syncBurstPerTick; i++ {
+		test.send(hostSide, syncData, civSyncSize, 0, true)
+	}
+	test.syncTickCount++
+	if cfg.fragEverySync > 0 && test.syncTickCount%cfg.fragEverySync == 1 {
+		test.send(hostSide, syncFrag, civMaxFragSize, 0, true)
 	}
 }
 
@@ -259,17 +323,7 @@ func (test *simulation) send(from side, kind packetKind, size, replyTo int, inSy
 	})
 	test.mu.Unlock()
 	binary.BigEndian.PutUint32(payload[len(test.tag):], uint32(id))
-	if kind == syncData && len(payload) > len(test.tag)+4 {
-		// Fill synthetic sync payloads with pseudo-random bytes so large
-		// test datagrams exercise wire-level fragmentation even with compression.
-		x := uint32(id)*2654435761 ^ 0x9e3779b9
-		for i := len(test.tag) + 4; i < len(payload); i++ {
-			x ^= x << 13
-			x ^= x >> 17
-			x ^= x << 5
-			payload[i] = byte(x)
-		}
-	}
+	fillPayload(payload, kind, id)
 	status := sendFailed
 	if sender.SendGameData(target, sourcePort, targetPort, payload, kind == find) {
 		status = submitted
@@ -277,6 +331,47 @@ func (test *simulation) send(from side, kind packetKind, size, replyTo int, inSy
 	test.mu.Lock()
 	test.packets[id-1].status = status
 	test.mu.Unlock()
+}
+
+// fillPayload synthesizes payloads matching real Civ 6 entropy profiles:
+//   - syncData (1180 B): mixes structured repeating tile/state records (~58%)
+//     with pseudo-random state bytes (~42%) so flate.BestSpeed compresses to
+//     ~45% of raw size, matching the 44.3% measured across real 4-hour captures.
+//   - syncFrag (1399 B): fully pseudo-random so it stays >MaxFragmentPayload
+//     after compression and genuinely exercises multi-fragment reassembly.
+func fillPayload(payload []byte, kind packetKind, id int) {
+	const headerLen = 12
+	if len(payload) <= headerLen {
+		return
+	}
+	x := uint32(id)*2654435761 ^ 0x9e3779b9
+	nextByte := func() byte {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		return byte(x)
+	}
+	switch kind {
+	case syncFrag:
+		for i := headerLen; i < len(payload); i++ {
+			payload[i] = nextByte()
+		}
+	case syncData:
+		// First ~58% structured Civ 6-like map/tile/struct records (highly
+		// compressible), remaining ~42% pseudo-random delta state.
+		split := headerLen + (len(payload)-headerLen)*58/100
+		pattern := [4]byte{0x00, 0xf1, 0xd8, 0xff}
+		for i := headerLen; i < split; i++ {
+			payload[i] = pattern[i&3]
+		}
+		for i := split; i < len(payload); i++ {
+			payload[i] = nextByte()
+		}
+	case state, found:
+		for i := headerLen; i < len(payload); i += 4 {
+			payload[i] = nextByte()
+		}
+	}
 }
 
 func (test *simulation) receive(to side, source uint8, sourcePort, targetPort uint16, payload []byte) {
@@ -303,11 +398,22 @@ func (test *simulation) receive(to side, source uint8, sourcePort, targetPort ui
 		test.packets[packet.replyTo-1].echo = now
 	}
 	kind, inSync := packet.kind, packet.inSync
+	sendSyncAck := false
+	if kind == syncData {
+		test.syncRecvCount++
+		// Reply with a 14 B ACK for 4 out of 5 sync datagrams (~80%),
+		// matching the real Civ 6 reverse ACK cadence.
+		sendSyncAck = test.syncRecvCount%5 != 0
+	}
 	test.mu.Unlock()
 	switch kind {
 	case find:
-		test.send(to, found, 1104, id, false)
+		test.send(to, found, discoveryReplySz, id, false)
 	case command:
-		test.send(to, ack, 72, id, inSync)
+		test.send(to, ack, ackSize, id, inSync)
+	case syncData:
+		if sendSyncAck {
+			test.send(to, syncAck, ackSize, 0, true)
+		}
 	}
 }

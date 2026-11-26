@@ -3,6 +3,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"net"
 	"os"
@@ -17,6 +18,9 @@ import (
 	"github.com/go-gui-org/go-gui/gui"
 	"github.com/go-gui-org/go-gui/gui/backend"
 )
+
+//go:embed app_icon.png
+var appIconPNG []byte
 
 const uiTitle = "文明 VI 联机中继"
 
@@ -63,6 +67,9 @@ type clientApp struct {
 	exportBusy bool
 	diag       diagState
 	netTest    netTestState
+	syncFixMod syncFixModStatus
+	openPathFn func(string) error       // optional test override for openFolder
+	modsRootFn func() (string, error)   // optional test override for defaultCiv6ModsRoot
 
 	refreshQueued atomic.Bool
 	stopped       atomic.Bool
@@ -78,6 +85,7 @@ func newClientApp(s *session, cfg Config) *clientApp {
 		autoScroll:   true,
 	}
 	app.netTest.init()
+	app.refreshSyncFixStatus()
 	if s != nil {
 		app.snap = s.Snapshot()
 		app.prevState = app.snap.State
@@ -99,6 +107,7 @@ func runNativeUI(s *session, cfg Config) error {
 	var w *gui.Window
 	w = gui.NewWindow(gui.WindowCfg{
 		Title:             uiTitle,
+		IconPNG:           appIconPNG,
 		Width:             980,
 		Height:            680,
 		MinWidth:          820,
@@ -350,11 +359,260 @@ func (a *clientApp) openCapturesDir(w *gui.Window) {
 		a.toast(w, gui.ToastError, "打开失败", "无法创建抓包目录，请检查本地磁盘权限。")
 		return
 	}
+	if a.openPathFn != nil {
+		if err := a.openPathFn(dir); err != nil {
+			a.toast(w, gui.ToastError, "打开失败", err.Error())
+			return
+		}
+		a.toast(w, gui.ToastInfo, "本地抓包目录已打开", dir)
+		return
+	}
 	if err := openFolder(dir); err != nil {
 		a.toast(w, gui.ToastError, "打开失败", err.Error())
 		return
 	}
 	a.toast(w, gui.ToastInfo, "本地抓包目录已打开", dir)
+}
+
+func (a *clientApp) modsRoot() (string, error) {
+	if a.modsRootFn != nil {
+		return a.modsRootFn()
+	}
+	return defaultCiv6ModsRoot()
+}
+
+func (a *clientApp) refreshSyncFixStatus() {
+	root, err := a.modsRoot()
+	if err != nil {
+		a.syncFixMod = syncFixModStatus{Err: err.Error()}
+		return
+	}
+	a.syncFixMod = inspectSyncFixMod(root)
+}
+
+func (a *clientApp) openPath(w *gui.Window, dir, title string) {
+	if a.openPathFn != nil {
+		if err := a.openPathFn(dir); err != nil {
+			a.toast(w, gui.ToastError, "打开失败", err.Error())
+			return
+		}
+		a.toast(w, gui.ToastInfo, title, dir)
+		return
+	}
+	if err := openFolder(dir); err != nil {
+		a.toast(w, gui.ToastError, "打开失败", err.Error())
+		return
+	}
+	a.toast(w, gui.ToastInfo, title, dir)
+}
+
+func (a *clientApp) installSyncFixFromUI(w *gui.Window) {
+	root, err := a.modsRoot()
+	if err != nil {
+		a.toast(w, gui.ToastError, "安装失败", err.Error())
+		return
+	}
+	installDir, err := installSyncFixMod(root)
+	a.refreshSyncFixStatus()
+	if err != nil {
+		if a.s != nil {
+			a.s.logError("安装同步修复 Mod 失败: %v", err)
+		}
+		a.toast(w, gui.ToastError, "同步修复 Mod 安装失败", err.Error())
+		w.InvalidateLayout()
+		return
+	}
+	if a.s != nil {
+		a.s.logOK("已安装同步修复 Mod 到 %s", installDir)
+	}
+	w.DialogDismiss()
+	a.toast(w, gui.ToastSuccess, "同步修复 Mod 安装成功", "请确保已取消订阅旧版 FastSync，并在游戏「额外内容 › 模组」勾选 Civ6SyncFix。")
+	w.InvalidateLayout()
+}
+
+func (a *clientApp) uninstallSyncFixFromUI(w *gui.Window) {
+	root, err := a.modsRoot()
+	if err != nil {
+		a.toast(w, gui.ToastError, "卸载失败", err.Error())
+		return
+	}
+	if err := uninstallSyncFixMod(root); err != nil {
+		if a.s != nil {
+			a.s.logError("卸载同步修复 Mod 失败: %v", err)
+		}
+		a.toast(w, gui.ToastError, "卸载失败", err.Error())
+		return
+	}
+	a.refreshSyncFixStatus()
+	if a.s != nil {
+		a.s.logInfo("已卸载同步修复 Mod (%s)", a.syncFixMod.InstallDir)
+	}
+	w.DialogDismiss()
+	a.toast(w, gui.ToastInfo, "同步修复 Mod 已卸载", "已移除本地 Civ6SyncFix 模组目录。")
+	w.InvalidateLayout()
+}
+
+func (a *clientApp) openSyncFixDialog(w *gui.Window) {
+	if w == nil || a.closing {
+		return
+	}
+	a.historyOpen = false
+	a.refreshSyncFixStatus()
+	w.Dialog(gui.DialogCfg{
+		ID:         "syncfix-dialog",
+		DialogType: gui.DialogCustom,
+		Title:      "一键安装同步修复 Mod（Civ6SyncFix）",
+		Width:      500,
+		FocusID:    "syncfix-confirm-install",
+		CustomView: func(vw *gui.Window) gui.View {
+			app := gui.State[clientApp](vw)
+			t := gui.CurrentTheme()
+			st := app.syncFixMod
+
+			statusLabel := "尚未安装"
+			statusVariant := gui.BadgeDefault
+			confirmLabel := "确定安装"
+			if st.Err != "" {
+				statusLabel = "目录异常"
+				statusVariant = gui.BadgeError
+			} else if st.UpToDate {
+				statusLabel = "已安装最新"
+				statusVariant = gui.BadgeSuccess
+				confirmLabel = "重新安装"
+			} else if st.Installed {
+				statusLabel = "检测到旧版"
+				statusVariant = gui.BadgeWarning
+				confirmLabel = "确定更新"
+			}
+
+			targetText := st.InstallDir
+			if st.Err != "" {
+				targetText = st.Err
+			}
+
+			bodyItems := []gui.View{
+				gui.Text(gui.TextCfg{
+					Text:      "Civ6SyncFix v1.3（DX11 / DX12 全支持）：修复 64 位哈希碰撞卡顿、局内重载隔回合死循环、后期 AI 重排巨作严重卡顿、国家奇观被抢打断、原版宗教 AI 未初始化不同步，并内置全对象字段级不同步诊断日志。",
+					TextStyle: t.TextStyleBody,
+					Mode:      gui.TextModeWrap,
+					Sizing:    gui.FillFit,
+				}),
+				subtlePanelView("syncfix-dialog-info", gui.FillFit,
+					gui.Row(gui.ContainerCfg{
+						Sizing:     gui.FillFit,
+						Padding:    gui.NoPadding,
+						SizeBorder: gui.NoBorder,
+						Spacing:    gui.SpacingSmall,
+						VAlign:     gui.VAlignMiddle,
+						Content: []gui.View{
+							gui.Text(gui.TextCfg{
+								Text:      "安装状态",
+								TextStyle: t.TextStyleLabel,
+								Sizing:    gui.FillFit,
+							}),
+							gui.Badge(gui.BadgeCfg{
+								Label:   statusLabel,
+								Variant: statusVariant,
+							}),
+						},
+					}),
+					gui.Text(gui.TextCfg{
+						Text:      "目标路径",
+						TextStyle: t.TextStyleCaption,
+					}),
+					gui.Text(gui.TextCfg{
+						Text:      targetText,
+						TextStyle: t.TextStyleCodeSmall,
+						Mode:      gui.TextModeWrap,
+						Sizing:    gui.FillFit,
+					}),
+				),
+				gui.Text(gui.TextCfg{
+					Text:      "安装后请在 Steam 创意工坊取消订阅旧版 FastSync 与 DX12 独立内核修复（3823991616），并在游戏「额外内容 › 模组」勾选「Civ6SyncFix」即可。",
+					TextStyle: t.TextStyleSecondary,
+					Mode:      gui.TextModeWrap,
+					Sizing:    gui.FillFit,
+				}),
+			}
+
+			if app.snap.CivRunning {
+				bodyItems = append(bodyItems, gui.Text(gui.TextCfg{
+					Text:      "提示：当前检测到文明 VI 正在运行，若写入 DLL 提示被占用，请先退出游戏后再点确定。",
+					TextStyle: t.TextStyleWarning,
+					Mode:      gui.TextModeWrap,
+					Sizing:    gui.FillFit,
+				}))
+			}
+
+			actions := make([]gui.View, 0, 5)
+			if st.Installed {
+				actions = append(actions,
+					gui.Button(gui.ButtonCfg{
+						ID:      "syncfix-open-dir",
+						Label:   "打开目录",
+						Variant: gui.ButtonGhost,
+						OnClick: func(ctx gui.EventCtx) {
+							ctx.Consume()
+							a := gui.State[clientApp](ctx.Window)
+							a.openPath(ctx.Window, a.syncFixMod.InstallDir, "Mod 目录已打开")
+						},
+					}),
+					gui.Button(gui.ButtonCfg{
+						ID:      "syncfix-uninstall",
+						Label:   "卸载",
+						Variant: gui.ButtonDanger,
+						OnClick: func(ctx gui.EventCtx) {
+							ctx.Consume()
+							gui.State[clientApp](ctx.Window).uninstallSyncFixFromUI(ctx.Window)
+						},
+					}),
+				)
+			}
+			actions = append(actions,
+				gui.Row(gui.ContainerCfg{
+					Sizing:     gui.FillFit,
+					Padding:    gui.NoPadding,
+					SizeBorder: gui.NoBorder,
+				}),
+				gui.Button(gui.ButtonCfg{
+					ID:      "syncfix-cancel",
+					Label:   "取消",
+					Variant: gui.ButtonSecondary,
+					OnClick: func(ctx gui.EventCtx) {
+						ctx.Consume()
+						ctx.Window.DialogDismiss()
+					},
+				}),
+				gui.Button(gui.ButtonCfg{
+					ID:       "syncfix-confirm-install",
+					Label:    confirmLabel,
+					Variant:  gui.ButtonPrimary,
+					Disabled: st.Err != "",
+					OnClick: func(ctx gui.EventCtx) {
+						ctx.Consume()
+						gui.State[clientApp](ctx.Window).installSyncFixFromUI(ctx.Window)
+					},
+				}),
+			)
+
+			bodyItems = append(bodyItems, gui.Row(gui.ContainerCfg{
+				Sizing:     gui.FillFit,
+				Padding:    gui.NewPadding(4, 0, 0, 0),
+				SizeBorder: gui.NoBorder,
+				Spacing:    gui.SpacingSmall,
+				VAlign:     gui.VAlignMiddle,
+				Content:    actions,
+			}))
+
+			return gui.Column(gui.ContainerCfg{
+				Sizing:     gui.FillFit,
+				Padding:    gui.NoPadding,
+				SizeBorder: gui.NoBorder,
+				Spacing:    gui.SpacingMedium,
+				Content:    bodyItems,
+			})
+		},
+	})
 }
 
 func (a *clientApp) statusMeta() (title, detail string, variant gui.BadgeVariant, accentColor gui.Color) {
@@ -729,10 +987,63 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 				Padding:    gui.NoPadding,
 				SizeBorder: gui.NoBorder,
 			}),
+			// One-click SyncFix Mod installer card
+			a.sidebarSyncFixCard(w),
 			// Persistent live status summary card
 			subtlePanelView("sidebar-status-card", gui.FillFit, summaryItems...),
 		},
 	})
+}
+
+func (a *clientApp) sidebarSyncFixCard(w *gui.Window) gui.View {
+	t := gui.CurrentTheme()
+	st := a.syncFixMod
+	badgeLabel := "未安装"
+	badgeVariant := gui.BadgeDefault
+	btnLabel := "一键安装修复 Mod"
+	btnVariant := gui.ButtonPrimary
+	if st.UpToDate {
+		badgeLabel = "已安装"
+		badgeVariant = gui.BadgeSuccess
+		btnLabel = "同步修复 Mod"
+		btnVariant = gui.ButtonSecondary
+	} else if st.Installed {
+		badgeLabel = "可更新"
+		badgeVariant = gui.BadgeWarning
+		btnLabel = "更新修复 Mod"
+		btnVariant = gui.ButtonPrimary
+	}
+
+	return subtlePanelView("sidebar-syncfix-card", gui.FillFit,
+		gui.Row(gui.ContainerCfg{
+			Sizing:     gui.FillFit,
+			Padding:    gui.NoPadding,
+			SizeBorder: gui.NoBorder,
+			VAlign:     gui.VAlignMiddle,
+			Content: []gui.View{
+				gui.Text(gui.TextCfg{
+					Text:      "联机同步修复",
+					TextStyle: t.TextStyleCaption,
+					Sizing:    gui.FillFit,
+				}),
+				gui.Badge(gui.BadgeCfg{
+					Label:   badgeLabel,
+					Variant: badgeVariant,
+				}),
+			},
+		}),
+		gui.Button(gui.ButtonCfg{
+			ID:       "sidebar-syncfix-btn",
+			Label:    btnLabel,
+			Variant:  btnVariant,
+			Disabled: a.closing,
+			Sizing:   gui.FillFit,
+			OnClick: func(ctx gui.EventCtx) {
+				ctx.Consume()
+				gui.State[clientApp](ctx.Window).openSyncFixDialog(ctx.Window)
+			},
+		}),
+	)
 }
 
 func (a *clientApp) footerBarView(w *gui.Window) gui.View {

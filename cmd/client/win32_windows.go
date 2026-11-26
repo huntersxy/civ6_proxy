@@ -4,6 +4,9 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -66,17 +69,28 @@ var (
 )
 
 func openFolder(path string) error {
+	cleaned := filepath.Clean(path)
+	if info, err := os.Stat(cleaned); err == nil && info.IsDir() {
+		cmd := exec.Command("explorer.exe", cleaned)
+		if err := cmd.Start(); err == nil {
+			go func() { _ = cmd.Wait() }()
+			return nil
+		}
+	}
 	operation, err := syscall.UTF16PtrFromString("open")
 	if err != nil {
 		return err
 	}
-	target, err := syscall.UTF16PtrFromString(path)
+	target, err := syscall.UTF16PtrFromString(cleaned)
 	if err != nil {
 		return err
 	}
 	result, _, callErr := procShellExecuteW.Call(0,
 		uintptr(unsafe.Pointer(operation)), uintptr(unsafe.Pointer(target)), 0, 0, uintptr(swShowNormal))
 	if result > 32 {
+		return nil
+	}
+	if err := exec.Command("explorer.exe", cleaned).Start(); err == nil {
 		return nil
 	}
 	if callErr != syscall.Errno(0) {

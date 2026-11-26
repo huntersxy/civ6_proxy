@@ -26,6 +26,9 @@ func newTestClientWindow(t *testing.T, dark bool) (*gui.Window, *clientApp) {
 		RelayHistory: []string{"203.0.113.10:42056", "198.51.100.7:42056"},
 	}
 	app := newClientApp(nil, cfg)
+	testModsRoot := filepath.Join(t.TempDir(), "Mods")
+	app.modsRootFn = func() (string, error) { return testModsRoot, nil }
+	app.refreshSyncFixStatus()
 	app.logEntries = []logEntry{
 		{Time: "22:00:01", Level: "INFO", Message: "Civ6RelayClient 启动"},
 		{Time: "22:00:02", Level: "OK", Message: "已进入房间 ABCD123456"},
@@ -194,6 +197,95 @@ func TestCanJoinWithDraft(t *testing.T) {
 	}
 }
 
+func TestCaptureDirButtonsInvokeOpen(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	var opened []string
+	app.openPathFn = func(p string) error {
+		opened = append(opened, p)
+		return nil
+	}
+
+	footerBtns := w.ResolveID("footer-capture-dir")
+	if len(footerBtns) != 1 {
+		t.Fatalf("expected 1 footer-capture-dir button, got %v", footerBtns)
+	}
+	if err := w.TestClick(footerBtns[0]); err != nil {
+		t.Fatalf("click footer-capture-dir: %v", err)
+	}
+
+	// Switch to Diagnostics & Logs page and click log-captures.
+	diagNav := w.ResolveID("nav-diaglog")
+	if err := w.TestClick(diagNav[0]); err != nil {
+		t.Fatalf("click nav-diaglog: %v", err)
+	}
+	logBtns := w.ResolveID("log-captures")
+	if len(logBtns) != 1 {
+		t.Fatalf("expected 1 log-captures button, got %v", logBtns)
+	}
+	if err := w.TestClick(logBtns[0]); err != nil {
+		t.Fatalf("click log-captures: %v", err)
+	}
+
+	if len(opened) != 2 || opened[0] != captureDirectory() || opened[1] != captureDirectory() {
+		t.Fatalf("unexpected opened capture dirs: %v", opened)
+	}
+}
+
+func TestSyncFixModDialogInstallAndUninstall(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	if app.syncFixMod.Installed {
+		t.Fatalf("expected syncFixMod not installed in fresh temp dir")
+	}
+
+	// Open confirmation dialog via sidebar button.
+	btns := w.ResolveID("sidebar-syncfix-btn")
+	if len(btns) != 1 {
+		t.Fatalf("expected 1 sidebar-syncfix-btn, got %v", btns)
+	}
+	if err := w.TestClick(btns[0]); err != nil {
+		t.Fatalf("click sidebar-syncfix-btn: %v", err)
+	}
+	w.TestRender(nil)
+	if dups := w.TestDuplicateIDs(); len(dups) != 0 {
+		t.Fatalf("dialog duplicate IDs: %v", dups)
+	}
+
+	// Confirm installation.
+	confirmBtns := w.ResolveID("syncfix-confirm-install")
+	if len(confirmBtns) != 1 {
+		t.Fatalf("expected 1 syncfix-confirm-install button, got %v", confirmBtns)
+	}
+	if err := w.TestClick(confirmBtns[0]); err != nil {
+		t.Fatalf("click syncfix-confirm-install: %v", err)
+	}
+	w.TestRender(nil)
+
+	if !app.syncFixMod.Installed || !app.syncFixMod.UpToDate {
+		t.Fatalf("expected syncFixMod installed & upToDate after confirm, got %+v", app.syncFixMod)
+	}
+	if _, err := os.Stat(filepath.Join(app.syncFixMod.InstallDir, "Civ6SyncFix.modinfo")); err != nil {
+		t.Fatalf("expected Civ6SyncFix.modinfo on disk: %v", err)
+	}
+
+	// Re-open dialog and uninstall cleanly.
+	btns = w.ResolveID("sidebar-syncfix-btn")
+	if err := w.TestClick(btns[0]); err != nil {
+		t.Fatalf("re-click sidebar-syncfix-btn: %v", err)
+	}
+	w.TestRender(nil)
+	unBtns := w.ResolveID("syncfix-uninstall")
+	if len(unBtns) != 1 {
+		t.Fatalf("expected 1 syncfix-uninstall button, got %v", unBtns)
+	}
+	if err := w.TestClick(unBtns[0]); err != nil {
+		t.Fatalf("click syncfix-uninstall: %v", err)
+	}
+	w.TestRender(nil)
+	if app.syncFixMod.Installed {
+		t.Fatalf("expected syncFixMod uninstalled, got %+v", app.syncFixMod)
+	}
+}
+
 func TestClientUISnapshots(t *testing.T) {
 	outDir := os.Getenv("CIV6_SNAPSHOT_DIR")
 	if outDir == "" {
@@ -265,11 +357,13 @@ func TestClientUISnapshots(t *testing.T) {
 		Discovery: playtest.Discovery{
 			Attempts: 3, Broadcasts: 3, Replies: 3,
 		},
-		HostToGuest: playtest.Delivery{Sent: 240, Received: 240, Settled: 240},
-		GuestToHost: playtest.Delivery{Sent: 240, Received: 239, Settled: 240, Missing: 1},
-		SteadyRTT:   playtest.Latency{Median: 21 * time.Millisecond, P95: 28 * time.Millisecond, Jitter: 2500 * time.Microsecond, Probes: 30, Replies: 30},
-		SyncRTT:     playtest.Latency{Median: 34 * time.Millisecond, P95: 52 * time.Millisecond, Jitter: 6100 * time.Microsecond, Probes: 12, Replies: 12},
-		Fragmented:  playtest.Delivery{Sent: 18, Received: 18},
+		HostToGuest:   playtest.Delivery{Sent: 10240, Received: 10240, Settled: 10240},
+		GuestToHost:   playtest.Delivery{Sent: 8160, Received: 8159, Settled: 8160, Missing: 1},
+		SteadyRTT:     playtest.Latency{Median: 21 * time.Millisecond, P95: 28 * time.Millisecond, Jitter: 2500 * time.Microsecond, Probes: 50, Replies: 50},
+		SyncRTT:       playtest.Latency{Median: 34 * time.Millisecond, P95: 52 * time.Millisecond, Jitter: 6100 * time.Microsecond, Probes: 100, Replies: 100},
+		Fragmented:    playtest.Delivery{Sent: 40, Received: 40},
+		HostRawBytes:  11_800_000,
+		HostWireBytes: 5_850_000,
 	}
 	save("nettest_play_dark", wDark)
 

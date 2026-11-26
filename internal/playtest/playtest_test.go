@@ -14,8 +14,17 @@ import (
 )
 
 var testProfile = profile{
-	handshake: time.Second, discoveryTick: 25 * time.Millisecond, discoveryWait: 125 * time.Millisecond,
-	playTime: 820 * time.Millisecond, gameTick: 20 * time.Millisecond, settle: 180 * time.Millisecond,
+	handshake:        time.Second,
+	discoveryTick:    25 * time.Millisecond,
+	discoveryWait:    125 * time.Millisecond,
+	playTime:         820 * time.Millisecond,
+	gameTick:         20 * time.Millisecond,
+	settle:           180 * time.Millisecond,
+	cycleSlots:       20,
+	syncStartSlot:    10,
+	syncBurstPerTick: 3,
+	probeEverySlots:  2,
+	fragEverySync:    5,
 }
 
 func startRelay(t *testing.T, drop func(protocol.Frame) bool) (string, int, *relay.Server) {
@@ -101,6 +110,10 @@ func TestSimulatesRelayAndReportsDroppedReplyAndFragment(t *testing.T) {
 	}
 	if stats := result.Fragmented; stats.Sent < 2 || stats.Missing != 1 || stats.Received != stats.Sent-1 {
 		t.Fatalf("unexpected fragmented delivery: %+v", stats)
+	}
+	if ratio := result.CompressionRatio(); result.HostRawBytes == 0 || ratio <= 0 || ratio >= 0.70 {
+		t.Fatalf("expected realistic Civ 6 wire compression (<70%%), got raw=%d wire=%d ratio=%.3f",
+			result.HostRawBytes, result.HostWireBytes, ratio)
 	}
 	for _, latency := range []Latency{result.SteadyRTT, result.SyncRTT} {
 		if latency.Probes == 0 || latency.Probes != latency.Replies || latency.Median <= 0 || latency.P95 <= 0 {

@@ -349,7 +349,7 @@ func (a *clientApp) netTestView(w *gui.Window) gui.View {
 		statusStyle = t.TextStyleSuccess.Bold()
 	}
 
-	startLabel, hint := "开始模拟", "同机双端 · 合成流量"
+	startLabel, hint := "开始模拟", "同机双端 · 文明 VI 实测流量模型（1180 B 同步突发 + 14 B 高频回执）"
 	if nt.mode == playMode && (nt.playRes.Create > 0 || nt.playRes.Discovery.Attempts > 0) {
 		startLabel = "重新模拟"
 	}
@@ -528,9 +528,13 @@ func (a *clientApp) playModeResultsView() gui.View {
 		},
 	)
 
-	fragments, failures := noSample, noSample
+	fragments, compression, failures := noSample, noSample, noSample
 	if res.Fragmented.Sent > 0 {
 		fragments = fmt.Sprintf("%d / %d", res.Fragmented.Received, res.Fragmented.Sent)
+	}
+	if ratio := res.CompressionRatio(); ratio > 0 {
+		compression = fmt.Sprintf("%.1f%% (%.2f → %.2f MB)",
+			ratio*100, float64(res.HostRawBytes)/1e6, float64(res.HostWireBytes)/1e6)
 	}
 	if res.Discovery.Attempts > 0 || res.SendFailures > 0 {
 		failures = fmt.Sprint(res.SendFailures)
@@ -542,7 +546,8 @@ func (a *clientApp) playModeResultsView() gui.View {
 		SizeBorder: gui.NoBorder,
 		Spacing:    gui.SpacingMedium,
 		Content: []gui.View{
-			kpiTileView("同步大包接收", fragments, t.TextStyleCode.Bold()),
+			kpiTileView("超长分片接收", fragments, t.TextStyleCode.Bold()),
+			kpiTileView("压缩线速占比", compression, t.TextStyleCode.Bold()),
 			kpiTileView("本地发送失败", failures, t.TextStyleCode.Bold()),
 		},
 	})

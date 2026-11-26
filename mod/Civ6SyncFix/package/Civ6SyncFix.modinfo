@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Mod id="7f3c8e21-4a9b-4d1e-9c52-8e1a6b4f2091" version="4">
+  <Properties>
+    <Name>LOC_CIV6SYNCFIX_MOD_NAME</Name>
+    <Description>LOC_CIV6SYNCFIX_MOD_DESCRIPTION</Description>
+    <Teaser>LOC_CIV6SYNCFIX_MOD_TEASER</Teaser>
+    <Authors>Civ6Relay</Authors>
+    <CompatibleVersions>1.2,2.0</CompatibleVersions>
+  </Properties>
+  <FrontEndActions>
+    <UpdateDatabase id="Civ6SyncFix_Config">
+      <Properties>
+        <LoadOrder>1</LoadOrder>
+      </Properties>
+      <File>Config/Civ6SyncFix_Config.sql</File>
+    </UpdateDatabase>
+  </FrontEndActions>
+  <InGameActions>
+    <UpdateDatabase id="Civ6SyncFix_InGame">
+      <Properties>
+        <LoadOrder>1</LoadOrder>
+      </Properties>
+      <File>Config/Civ6SyncFix_Config.sql</File>
+    </UpdateDatabase>
+  </InGameActions>
+  <LocalizedText>
+    <Text id="LOC_CIV6SYNCFIX_MOD_NAME">
+      <en_US>Civ6SyncFix v1.3 - 64-bit Sync, Core Bugfixes &amp; Desync Diagnostics (DX11/DX12)</en_US>
+      <zh_Hans_CN>Civ6SyncFix v1.3 - 联机64位同步、内核修复与不同步诊断（DX11/DX12）</zh_Hans_CN>
+    </Text>
+    <Text id="LOC_CIV6SYNCFIX_MOD_TEASER">
+      <en_US>True 64-bit sync hash, post-reload fix, AI Great Work lag fix, National Wonder protection, Religion AI desync fix, and universal field-level desync logging (DX11/DX12).</en_US>
+      <zh_Hans_CN>原生64位哈希同步、防重载隔回合死循环、AI后期重排巨作卡顿修复、国家奇观防被抢、宗教AI未初始化不同步修复与全字段诊断（DX11/DX12全支持）。</zh_Hans_CN>
+    </Text>
+    <Text id="LOC_CIV6SYNCFIX_MOD_DESCRIPTION">
+      <en_US>Works on both DX11 and DX12: (1) Fixes FGameSyncManager 32-bit hash truncation without mutating keys; (2) Suppresses stale post-resync TurnSynchronizationBarrier (2-turn oscillation bug); (3) Logs exact desynced AutoVariable field names for any archive type; (4) Fixes AI Great Work rearrangement O(N^3) late-game lag; (5) Prevents completed National Wonders from cancelling other civs' builds; (6) Fixes vanilla Religion AI uninitialized stack bool multiplayer desync.</en_US>
+      <zh_Hans_CN>全面支持 DX11 与 DX12：1）修复引擎 64 位 AutoArchive 哈希截断卡顿（不篡改 Key）；2）修复局内重载后隔回合死循环 Bug；3）内置全对象字段级不同步精准诊断（零开销）；4）修复后期 AI 重排巨作导致的严重卡顿；5）修复国家奇观建成后其他文明在建国家奇观被强行打断的问题；6）修复原版宗教 AI 栈变量未初始化导致的联机不同步。</zh_Hans_CN>
+    </Text>
+  </LocalizedText>
+  <Files>
+    <File>Config/Civ6SyncFix_Config.sql</File>
+    <File>Binaries/Win64/GameCore_XP2_Civ6SyncFix_FinalRelease.dll</File>
+    <File>Binaries/Win64/c6se/Civ6SyncFix.dll</File>
+  </Files>
+</Mod>

@@ -1,0 +1,10 @@
+"workshopitem"
+{
+	"appid"		"289070"
+	"publishedfileid"		"3846146819"
+	"contentfolder"		"D:\\CODE\\civ6_proxy\\dist\\Civ6SyncFix"
+	"visibility"		"0"
+	"title"		"Civ6SyncFix - 联机64位同步优化、内核修复与不同步诊断（DX11/DX12）"
+	"description"		"全面支持 DX11 与 DX12，支持 C6SE 加载，也可独立启用（零外部依赖）。\n\n【核心修复】\n1. 修复文明 VI 引擎 64 位 AutoArchive 哈希截断导致的联机同步/过回合严重卡顿（不篡改 Key，彻底避免碰撞风险）\n2. 修复原版局内重载（Resync）后触发隔回合不同步死循环的 Bug\n3. 修复后期 AI 重排巨作导致的 O(N³) 严重卡顿（巨作数 > 32 时跳过组合爆炸，联机完全确定性一致）\n4. 修复国家奇观建成后导致其他文明在建国家奇观被强行打断的问题（世界奇观与己方其他城市逻辑保持原版）\n5. 修复原版宗教 AI 栈变量未初始化导致的联机不同步\n6. 内置全对象字段级不同步精准诊断日志（仅在发生不同步时输出，正常回合零性能开销，日志位于 %LOCALAPPDATA%\\Firaxis Games\\Sid Meier's Civilization VI\\Logs\\Civ6SyncFix.log）\n\n【使用说明】\n- 联机对局请确保房主与所有队友均启用本 Mod\n- 请勿与旧版 FastSync 或其他同功能内核修复 Mod（如 3823991616）同时启用\n- 若此前手动在本地 Mods 目录安装过 Civ6SyncFix，订阅创意工坊版后请删除本地副本以免列表重复"
+	"changenote"		"v1.3 首次发布：全面支持 DX11/DX12，整合 64 位哈希同步、防重载隔回合死循环、AI 巨作卡顿修复、国家奇观保护、宗教 AI 未初始化修复及全对象不同步字段诊断。"
+}

@@ -70,6 +70,9 @@ func checkPlay(address string) error {
 		fmt.Printf("%s replies=%d/%d median=%s p95=%s jitter=%s\n", [...]string{"steady", "sync"}[index],
 			latency.Replies, latency.Probes, latency.Median.Round(time.Microsecond), latency.P95.Round(time.Microsecond), latency.Jitter.Round(time.Microsecond))
 	}
+	if ratio := result.CompressionRatio(); ratio > 0 {
+		fmt.Printf("host_traffic raw=%d B wire=%d B ratio=%.1f%%\n", result.HostRawBytes, result.HostWireBytes, ratio*100)
+	}
 	if err != nil {
 		return err
 	}

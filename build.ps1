@@ -11,6 +11,15 @@ Push-Location $PSScriptRoot
 try {
     $env:GOOS = $null
     $env:GOARCH = $null
+    $embeddedMod = Join-Path $PSScriptRoot 'cmd\client\civ6syncfix.zip'
+    $distModZip = Join-Path $OutputDir 'Civ6SyncFix.zip'
+    if (Test-Path $distModZip) {
+        Copy-Item -LiteralPath $distModZip -Destination $embeddedMod -Force
+    }
+    if (-not (Test-Path $embeddedMod)) {
+        throw "Missing embedded mod package $embeddedMod; run mod\Civ6SyncFix\build.ps1 first"
+    }
+
     Write-Host "==> go test ./..."
     go test ./...
     if ($LASTEXITCODE -ne 0) { throw "tests failed" }

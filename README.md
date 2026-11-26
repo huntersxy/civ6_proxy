@@ -149,10 +149,10 @@ go build -trimpath -ldflags "-s -w -X main.version=dev" -o dist/civ6relay-server
 go build -trimpath -ldflags "-s -w" -o dist/civ6relay-tunnelcheck ./cmd/tunnelcheck
 ```
 
-若修改了 [cmd/client/app.manifest](cmd/client/app.manifest)，需重新生成嵌入清单资源：
+若修改了 [cmd/client/app.manifest](cmd/client/app.manifest) 或 [cmd/client/app_icon.ico](cmd/client/app_icon.ico)，需重新生成嵌入资源：
 
 ```powershell
-go run github.com/akavel/rsrc@latest -manifest cmd/client/app.manifest -o cmd/client/rsrc_windows_amd64.syso -arch amd64
+go run github.com/akavel/rsrc@latest -manifest cmd/client/app.manifest -ico cmd/client/app_icon.ico -o cmd/client/rsrc_windows_amd64.syso -arch amd64
 ```
 
 ### CI 自动发包

@@ -29,6 +29,17 @@ type Result struct {
 	Fragmented                  Delivery
 	SendFailures                int
 	SteadyRTT, SyncRTT          Latency
+	HostRawBytes                uint64
+	HostWireBytes               uint64
+}
+
+// CompressionRatio returns the wire-to-raw ratio (0..1+) for host outbound
+// traffic during the play phase, or 0 when no raw payload bytes were recorded.
+func (r Result) CompressionRatio() float64 {
+	if r.HostRawBytes == 0 || r.HostWireBytes == 0 {
+		return 0
+	}
+	return float64(r.HostWireBytes) / float64(r.HostRawBytes)
 }
 
 func (test *simulation) publish(now time.Time) {
@@ -76,9 +87,11 @@ func (test *simulation) snapshot(now time.Time) Result {
 		delivery := &result.HostToGuest
 		if packet.from == guestSide {
 			delivery = &result.GuestToHost
+		} else {
+			result.HostRawBytes += uint64(packet.size)
 		}
 		delivery.record(received, settled)
-		if packet.kind == syncData && packet.size > protocol.MaxFragmentPayload {
+		if (packet.kind == syncData || packet.kind == syncFrag) && packet.size > protocol.MaxFragmentPayload {
 			result.Fragmented.record(received, settled)
 		}
 		if packet.kind == command {
@@ -90,6 +103,12 @@ func (test *simulation) snapshot(now time.Time) Result {
 			if arrived(packet.echo, now) {
 				*samples = append(*samples, max(time.Nanosecond, packet.echo.Sub(packet.sentAt)))
 			}
+		}
+	}
+	if c := test.clients[hostSide]; c != nil {
+		tx := c.Metrics().TunnelTxBytes
+		if tx >= test.hostWireAtStart {
+			result.HostWireBytes = tx - test.hostWireAtStart
 		}
 	}
 	result.SteadyRTT.measure(steady)

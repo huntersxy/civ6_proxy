@@ -51,7 +51,7 @@ func RelaunchAsAdmin(args string) error {
 	cwd, _ := syscall.UTF16PtrFromString("")
 	shell32 := syscall.NewLazyDLL("shell32.dll")
 	proc := shell32.NewProc("ShellExecuteW")
-	r, _, _ := proc.Call(
+	r, _, callErr := proc.Call(
 		0,
 		uintptr(unsafe.Pointer(verb)),
 		uintptr(unsafe.Pointer(file)),
@@ -60,6 +60,10 @@ func RelaunchAsAdmin(args string) error {
 		1, // SW_SHOWNORMAL
 	)
 	if r <= 32 {
+		const errCancelled = syscall.Errno(1223)
+		if callErr == errCancelled || r == 5 {
+			return fmt.Errorf("已取消 UAC 授权或系统拒绝提权")
+		}
 		return fmt.Errorf("以管理员身份启动失败 (ShellExecute=%d)", r)
 	}
 	return nil

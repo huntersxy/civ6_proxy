@@ -1,4 +1,7 @@
 dist/
+mod/Civ6SyncFix/build/
+mod/Civ6SyncFix/package/Binaries/
+mod/Civ6SyncFix/tools/
 *.exe
 *.test
 *.out
