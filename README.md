@@ -39,6 +39,32 @@
 
 ## 中转端部署
 
+### Docker 部署（推荐，零配置）
+
+一条命令拉起，带宽与限速参数自动计算：
+
+```bash
+docker compose up -d
+```
+
+- 首次运行自动构建镜像；后续更新执行 `docker compose up -d --build`。
+- 默认使用 `network_mode: host`（Linux），可直接探测宿主机 NIC 速度，UDP 转发无端口映射开销。
+- 服务端口默认 `42056/UDP`；云安全组与主机防火墙需放行该端口。
+- entrypoint 按 **NIC 速度 × 80% ÷ 预期并发成员数** 自动均分每人限额，无需手动填写带宽。
+- 如需覆盖任何参数，在 `docker-compose.yml` 的 `environment` 下追加对应变量即可。
+
+**可用环境变量**
+
+| 变量 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `CIV6_TOTAL_MBPS` | 自动检测 | 服务器总上传带宽（Mbps），留空则读取 NIC 速度，仍无法探测则回退 100 Mbps |
+| `CIV6_MAX_MEMBERS` | `100` | 预期峰值并发成员数；带宽按此值均分 |
+| `CIV6_MAX_ROOMS` | `1024` | 最大并发房间数 |
+| `CIV6_PORT` | `42056` | 监听 UDP 端口 |
+| `CIV6_SPEEDTEST_MBPS` | `0` | 速测上限 Mbps（0 禁用） |
+| `CIV6_QUIET` | `0` | `1` 关闭房间日志 |
+| `CIV6_READERS` | `0` | UDP 读取协程数（0 = 使用服务端默认值 1） |
+
 前置条件：具备公网 IPv4 地址，且云安全组与主机防火墙均已放行入站 **UDP `42056`**。
 
 ### systemd 安装
@@ -183,6 +209,9 @@ internal/
   packet/              IPv4/UDP 数据报解析与构造
   win/                 WinDivert 加载、流量桥接、路由/防火墙/进程检测
 deploy/                systemd 服务单元与防火墙 drop-in 配置
+Dockerfile             多阶段构建，产出精简 Alpine 运行镜像
+docker-compose.yml     一键部署（host 网络 + 自动带宽均分）
+docker-entrypoint.sh   探测 NIC 速度并计算 -member-* 限额
 .github/workflows/     CI 测试与 Tag 自动发包工作流
 ```
 

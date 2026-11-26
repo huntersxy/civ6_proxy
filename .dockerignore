@@ -1,0 +1,16 @@
+# build context exclusions
+.git
+.github
+dist
+mod
+*.exe
+*.test
+*.out
+.idea
+.vscode
+*.md
+!go.mod
+!go.sum
+collect_teammate_logs.bat
+build.ps1
+_fix_readme.py

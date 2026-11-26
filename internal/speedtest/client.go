@@ -172,7 +172,7 @@ func (test *client) measure(phase Phase, duration time.Duration) error {
 	test.publish()
 	started := time.Now()
 	lastReply, maxEnd := started, started.Add(duration+2*leaseTime)
-	var probes [16]probeSample
+	var probes [64]probeSample
 	var remote message
 	var delay latencySamples
 	var rate transferSamples
@@ -231,14 +231,20 @@ func (test *client) measure(phase Phase, duration time.Duration) error {
 					downloaded.add(in.serial)
 				}
 			case status:
-				stamp := &probes[in.serial%uint32(len(probes))]
-				if stamp.serial == in.serial && !stamp.sentAt.IsZero() && in.received <= in.sent &&
-					in.sent <= packetLimit(duration, test.result.MaxMbps) {
-					lastReply = time.Now()
-					if !in.final && !request.final {
-						delay.add(lastReply.Sub(stamp.sentAt))
+				if in.received <= in.sent && in.sent <= packetLimit(duration, test.result.MaxMbps) {
+					nowReply := time.Now()
+					stamp := &probes[in.serial%uint32(len(probes))]
+					var rtt time.Duration
+					if stamp.serial == in.serial && !stamp.sentAt.IsZero() {
+						rtt = nowReply.Sub(stamp.sentAt)
+						if !in.final && !request.final {
+							delay.add(rtt)
+						}
+						stamp.sentAt = time.Time{}
 					}
-					stamp.sentAt = time.Time{}
+					if in.serial > remote.serial || rtt > 0 {
+						lastReply = nowReply
+					}
 					if in.serial > remote.serial {
 						remote = in
 						if phase == Upload {
@@ -246,6 +252,9 @@ func (test *client) measure(phase Phase, duration time.Duration) error {
 								upload = test.startUpload(ctx, duration)
 							}
 							upload.setFeedback(in.sent, in.received)
+							if rtt > 0 && !in.final && !request.final {
+								upload.setRTT(rtt)
+							}
 						}
 					}
 				}
@@ -298,8 +307,9 @@ func (test *client) startUpload(ctx context.Context, duration time.Duration) *up
 	upload := &uploadTrain{sendProgress: &sendProgress{}, started: time.Now(), done: make(chan sendResult, 1)}
 	_ = test.conn.SetWriteDeadline(upload.started.Add(duration + leaseTime))
 	limit := test.result.MaxMbps
+	baselineRTT := test.result.Latency[Baseline].Median
 	go func() {
-		upload.done <- sendTrain(ctx, test.id, Upload, duration, limit, upload.sendProgress,
+		upload.done <- sendTrainWithBaseline(ctx, test.id, Upload, duration, limit, baselineRTT, upload.sendProgress,
 			func() bool { return true }, func(packet []byte) error {
 				_, err := test.conn.Write(packet)
 				return err

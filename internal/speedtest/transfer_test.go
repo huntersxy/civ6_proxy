@@ -98,3 +98,45 @@ func TestRateControllerConfirmsLightLoss(t *testing.T) {
 		t.Fatal("persistent light loss did not reduce the rate")
 	}
 }
+
+func TestRateControllerTamesBufferbloat(t *testing.T) {
+	// Simulate a 46 Mbps residential uplink with a deep lossless FIFO modem buffer (0% packet loss,
+	// pure queuing delay swell — the exact scenario that used to choke probes past leaseTime=2.5s).
+	const (
+		capacityMbps = 46.0
+		baseRTT      = 48 * time.Millisecond
+	)
+	started := time.Now()
+	controller := newRateControllerWithBaseline(200, started, baseRTT)
+	capPps := capacityMbps * packetsPerMbps
+
+	var sent, delivered uint32
+	var queued float64
+	var maxRTT time.Duration
+	for elapsed := pollInterval; elapsed <= DefaultDuration; elapsed += pollInterval {
+		batch := uint32(controller.rate * pollInterval.Seconds())
+		sent += batch
+		queued += float64(batch)
+		drained := min(queued, capPps*pollInterval.Seconds())
+		queued -= drained
+		delivered += uint32(drained)
+
+		queueDelay := time.Duration(queued / capPps * float64(time.Second))
+		rtt := baseRTT + queueDelay
+		if rtt > maxRTT {
+			maxRTT = rtt
+		}
+		controller.update(started.Add(elapsed), sent, deliverySample{
+			seen:     delivered,
+			received: delivered,
+			rtt:      rtt,
+		})
+	}
+	avgMbps := mbps(delivered, DefaultDuration)
+	if maxRTT >= 1200*time.Millisecond {
+		t.Fatalf("bufferbloat queue delay grew too high: maxRTT=%v (avg=%.2f Mbps)", maxRTT, avgMbps)
+	}
+	if avgMbps < 34 || avgMbps > capacityMbps+1 {
+		t.Fatalf("unexpected throughput under bufferbloat: avg=%.2f Mbps, maxRTT=%v", avgMbps, maxRTT)
+	}
+}
