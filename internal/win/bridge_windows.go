@@ -20,7 +20,7 @@ const (
 	discoveryPortMax   = 62999
 	firstVirtualMember = 2
 	lastVirtualMember  = 9
-	injectionQueueSize = 256
+	injectionQueueSize = 1024
 )
 
 // BridgeStats is a snapshot of packet bridge counters.

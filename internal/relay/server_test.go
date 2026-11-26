@@ -603,4 +603,54 @@ func TestConfiguredMemberRateRefills(t *testing.T) {
 			t.Fatalf("packet %d: got %d outbound frames, want %d", index, len(out), count)
 		}
 	}
+	if drops := server.DropStats(); drops.RateDrops != 1 {
+		t.Fatalf("expected 1 rate drop, got %+v", drops)
+	}
+}
+
+func TestCompressedFlagForwardedAndDropStatsTracked(t *testing.T) {
+	s, _ := newTestServer(t)
+	a, b := addr(1), addr(2)
+	wA := doHandshake(t, s, protocol.KindCreate, protocol.HandshakeRequest{RequestID: "aaaabbbbccccdddd", Name: "A"}, a).welcome
+	tokenA := tokenOf(t, wA)
+	roomID := parseRoomID(t, wA.RoomID)
+	outJoin := s.Handle(encodeHandshake(t, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "ddddccccbbbbaaaa", Name: "B", RoomCode: wA.RoomCode,
+	}), b)
+	var wB protocol.WelcomeMessage
+	_ = protocol.DecodeControl(decodeOutbound(t, outJoin)[0].Payload, &wB)
+	tokenB := tokenOf(t, &wB)
+
+	frame := protocol.Frame{
+		Kind: protocol.KindData, Flags: protocol.FlagCompressed, RoomID: roomID,
+		SourceMember: 2, TargetMember: 3, Sequence: 1, PacketID: 1,
+		FragmentCount: 1, SourcePort: 62056, TargetPort: 62056, Payload: []byte("compressed-bytes"),
+	}
+	raw, err := frame.Encode(tokenA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := s.Handle(raw, a)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 forwarded frame, got %d", len(out))
+	}
+	got, err := protocol.Decode(out[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Verified(tokenB) || got.Flags&protocol.FlagCompressed == 0 {
+		t.Fatalf("FlagCompressed not preserved: %+v", got)
+	}
+
+	// Trigger decode, auth, and replay drops.
+	_ = s.Handle([]byte("bad"), a)
+	badToken := append([]byte(nil), tokenA...)
+	badToken[0] ^= 0xff
+	_ = s.Handle(clientFrame(t, badToken, roomID, 2, protocol.KindData, 3, 2, []byte("x")), a)
+	_ = s.Handle(raw, a) // replay seq 1
+
+	drops := s.DropStats()
+	if drops.DecodeErrors != 1 || drops.AuthFailures != 1 || drops.ReplayDrops != 1 {
+		t.Fatalf("unexpected drop stats: %+v", drops)
+	}
 }

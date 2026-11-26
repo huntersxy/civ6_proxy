@@ -95,10 +95,12 @@ type Client struct {
 	relay netip.AddrPort
 	start time.Time
 
-	room       atomic.Pointer[clientRoom]
-	sendMu     sync.Mutex
-	sendBuffer [protocol.MaxOuterDatagram]byte
-	packetID   uint32
+	room         atomic.Pointer[clientRoom]
+	sendMu       sync.Mutex
+	sendBuffer   [protocol.MaxOuterDatagram]byte
+	compressor   *protocol.Compressor
+	decompressor *protocol.Decompressor
+	packetID     uint32
 
 	pendingMu sync.Mutex
 	pending   *pendingHandshake
@@ -174,13 +176,15 @@ func NewContext(ctx context.Context, host string, port int) (*Client, error) {
 	_ = conn.SetReadBuffer(4 << 20)
 	_ = conn.SetWriteBuffer(1 << 20)
 	c := &Client{
-		conn:     conn,
-		relay:    netip.AddrPortFrom(addresses[0].Unmap(), uint16(port)),
-		start:    time.Now(),
-		packetID: randomUint32(),
-		probe:    make(chan struct{}, 1),
-		p2pWake:  make(chan struct{}, 1),
-		stop:     make(chan struct{}),
+		conn:         conn,
+		relay:        netip.AddrPortFrom(addresses[0].Unmap(), uint16(port)),
+		start:        time.Now(),
+		compressor:   protocol.NewCompressor(),
+		decompressor: protocol.NewDecompressor(),
+		packetID:     randomUint32(),
+		probe:        make(chan struct{}, 1),
+		p2pWake:      make(chan struct{}, 1),
+		stop:         make(chan struct{}),
 	}
 	c.wg.Add(2)
 	go c.readLoop()
@@ -373,7 +377,8 @@ func (c *Client) SendGameData(targetMember uint8, sourcePort, targetPort uint16,
 	if room == nil || c.closed.Load() {
 		return false
 	}
-	count := max(1, (len(payload)+protocol.MaxFragmentPayload-1)/protocol.MaxFragmentPayload)
+	wirePayload, compressed := c.compressor.Compress(payload)
+	count := max(1, (len(wirePayload)+protocol.MaxFragmentPayload-1)/protocol.MaxFragmentPayload)
 	c.packetID++
 	frame := protocol.Frame{
 		Kind:          protocol.KindData,
@@ -390,17 +395,20 @@ func (c *Client) SendGameData(targetMember uint8, sourcePort, targetPort uint16,
 	if count > 1 {
 		frame.Flags |= protocol.FlagFragmented
 	}
+	if compressed {
+		frame.Flags |= protocol.FlagCompressed
+	}
 	var direct *p2pPath
 	if !broadcast && room.p2p.enabled && validMember(targetMember) {
 		now := time.Now()
-		if path := room.p2p.paths[targetMember]; path != nil && room.p2p.usable(now) && path.ready(now) {
+		if path := room.p2p.paths[targetMember]; path != nil && room.p2p.usable(now) && path.activeDirect(now) {
 			direct = path
 		}
 	}
 	for index := 0; index < count; index++ {
 		offset := index * protocol.MaxFragmentPayload
 		frame.FragmentIndex = uint16(index)
-		frame.Payload = payload[offset:min(len(payload), offset+protocol.MaxFragmentPayload)]
+		frame.Payload = wirePayload[offset:min(len(wirePayload), offset+protocol.MaxFragmentPayload)]
 		if direct != nil {
 			if c.writePeerFrame(room, direct, &frame) {
 				c.counter.directTxFrames.Add(1)
@@ -593,6 +601,7 @@ func (c *Client) handleAuthenticated(frame *protocol.Frame, raw []byte) {
 			state.relayPending[memberID] = 0
 			state.relaySentAt[memberID] = time.Time{}
 			state.relayRTT[memberID] = 0
+			state.updatePathPreference(memberID)
 		}
 		for _, previous := range *room.peers.Load() {
 			unchanged := false
@@ -643,6 +652,7 @@ func (c *Client) handleAuthenticated(frame *protocol.Frame, raw []byte) {
 			state.relayRTT[frame.SourceMember] = max(time.Since(state.relaySentAt[frame.SourceMember]), time.Nanosecond)
 			state.relayPending[frame.SourceMember] = 0
 			state.relaySentAt[frame.SourceMember] = time.Time{}
+			state.updatePathPreference(frame.SourceMember)
 		}
 		c.sendMu.Unlock()
 	case protocol.KindRoomClosed:
@@ -666,14 +676,20 @@ func (c *Client) deliverGameData(room *clientRoom, frame *protocol.Frame) {
 	if payload == nil {
 		return
 	}
+	if frame.Flags&protocol.FlagCompressed != 0 {
+		payload, err = c.decompressor.Decompress(payload)
+		if err != nil {
+			c.counter.dropped.Add(1)
+			return
+		}
+	} else if frame.FragmentCount == 1 {
+		payload = bytes.Clone(payload)
+	}
 	c.counter.gameRxDatagrams.Add(1)
 	c.handlerMu.RLock()
 	h := c.dataHandler
 	c.handlerMu.RUnlock()
 	if h != nil {
-		if frame.FragmentCount == 1 {
-			payload = bytes.Clone(payload)
-		}
 		h(frame.SourceMember, frame.SourcePort, frame.TargetPort, payload)
 	}
 }

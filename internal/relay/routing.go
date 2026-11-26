@@ -10,7 +10,16 @@ func (s *Server) handleAuthenticated(r *room, frame *protocol.Frame, addr netip.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	m := r.member(frame.SourceMember)
-	if r.closed || m == nil || !m.auth.Verify(raw) || !m.replay.Accept(frame.Sequence) {
+	if r.closed || m == nil {
+		s.drops.unknownRoom.Add(1)
+		return
+	}
+	if !m.auth.Verify(raw) {
+		s.drops.authFailures.Add(1)
+		return
+	}
+	if !m.replay.Accept(frame.Sequence) {
+		s.drops.replayDrops.Add(1)
 		return
 	}
 	now := s.clock()
@@ -56,6 +65,8 @@ func (s *Server) handleAuthenticated(r *room, frame *protocol.Frame, addr netip.
 	case protocol.KindData:
 		if m.limit.allow(len(raw), now) {
 			r.routeDataLocked(m, frame, batch)
+		} else {
+			s.drops.rateDrops.Add(1)
 		}
 	}
 }
@@ -78,7 +89,7 @@ func (r *room) routePathProbeLocked(sender *member, frame *protocol.Frame, now f
 
 func (r *room) routeDataLocked(sender *member, frame *protocol.Frame, batch *Batch) {
 	forwarded := *frame
-	forwarded.Flags &= protocol.FlagBroadcast | protocol.FlagFragmented
+	forwarded.Flags &= protocol.FlagBroadcast | protocol.FlagFragmented | protocol.FlagCompressed
 	if frame.TargetMember != broadcastMember {
 		m := r.member(frame.TargetMember)
 		if m != nil && m.online && m != sender {

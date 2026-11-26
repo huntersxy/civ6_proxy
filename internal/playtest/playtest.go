@@ -259,6 +259,17 @@ func (test *simulation) send(from side, kind packetKind, size, replyTo int, inSy
 	})
 	test.mu.Unlock()
 	binary.BigEndian.PutUint32(payload[len(test.tag):], uint32(id))
+	if kind == syncData && len(payload) > len(test.tag)+4 {
+		// Fill synthetic sync payloads with pseudo-random bytes so large
+		// test datagrams exercise wire-level fragmentation even with compression.
+		x := uint32(id)*2654435761 ^ 0x9e3779b9
+		for i := len(test.tag) + 4; i < len(payload); i++ {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			payload[i] = byte(x)
+		}
+	}
 	status := sendFailed
 	if sender.SendGameData(target, sourcePort, targetPort, payload, kind == find) {
 		status = submitted

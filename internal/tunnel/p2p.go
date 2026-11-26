@@ -12,13 +12,15 @@ import (
 )
 
 const (
-	p2pTick         = 500 * time.Millisecond
-	p2pPollEvery    = 2 * time.Second
-	p2pProbeEvery   = time.Second
-	p2pRetryEvery   = 3 * time.Second
-	p2pPathTimeout  = 4 * time.Second
-	p2pProbeHistory = 8
-	maxMemberID     = 9
+	p2pTick                = 500 * time.Millisecond
+	p2pPollEvery           = 2 * time.Second
+	p2pProbeEvery          = time.Second
+	p2pRetryEvery          = 3 * time.Second
+	p2pPathTimeout         = 4 * time.Second
+	p2pRelayPreferMargin   = 15 * time.Millisecond
+	p2pDirectRestoreMargin = 5 * time.Millisecond
+	p2pProbeHistory        = 8
+	maxMemberID            = 9
 )
 
 type PeerPath uint8
@@ -74,6 +76,7 @@ type p2pPath struct {
 	probeCursor   uint8
 	rtt           time.Duration
 	verifiedUntil time.Time
+	preferRelay   bool
 }
 
 type peerProbe struct {
@@ -106,10 +109,10 @@ func (c *Client) P2PStatus() P2PStatus {
 				continue
 			}
 			status.Endpoints = append(status.Endpoints, path.address)
-			if path.ready(now) {
+			if path.activeDirect(now) {
 				status.Peers[memberID] = Direct
 				status.PeerRTT[memberID] = path.rtt
-			} else if now.Sub(path.started) < p2pPathTimeout {
+			} else if !path.ready(now) && now.Sub(path.started) < p2pPathTimeout {
 				status.Peers[memberID] = Punching
 			}
 		}
@@ -142,6 +145,32 @@ func (state *p2pRoom) usable(now time.Time) bool {
 }
 
 func (path *p2pPath) ready(now time.Time) bool { return now.Before(path.verifiedUntil) }
+
+func (path *p2pPath) activeDirect(now time.Time) bool {
+	return path.ready(now) && !path.preferRelay
+}
+
+func (state *p2pRoom) updatePathPreference(memberID uint8) {
+	if !validMember(memberID) {
+		return
+	}
+	path := state.paths[memberID]
+	if path == nil {
+		return
+	}
+	relayRTT := state.relayRTT[memberID]
+	if relayRTT <= 0 || path.rtt <= 0 {
+		path.preferRelay = false
+		return
+	}
+	if !path.preferRelay {
+		if path.rtt > relayRTT+p2pRelayPreferMargin && path.rtt*4 > relayRTT*5 {
+			path.preferRelay = true
+		}
+	} else if path.rtt <= relayRTT+p2pDirectRestoreMargin {
+		path.preferRelay = false
+	}
+}
 
 func validMember(id uint8) bool { return id >= 2 && id <= maxMemberID }
 
@@ -350,6 +379,7 @@ func (c *Client) handlePeerDatagram(address netip.AddrPort, raw []byte) {
 				path.probes[index] = peerProbe{}
 				path.rtt = max(now.Sub(probe.sentAt), time.Nanosecond)
 				path.verifiedUntil = now.Add(p2pPathTimeout)
+				room.p2p.updatePathPreference(frame.SourceMember)
 				break
 			}
 		}

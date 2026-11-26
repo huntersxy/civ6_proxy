@@ -95,6 +95,7 @@ const (
 	FlagAuthenticated Flags = 1 << 0
 	FlagBroadcast     Flags = 1 << 1
 	FlagFragmented    Flags = 1 << 2
+	FlagCompressed    Flags = 1 << 3
 )
 
 // Errors returned by Decode.

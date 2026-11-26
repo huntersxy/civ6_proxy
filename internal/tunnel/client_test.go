@@ -235,3 +235,49 @@ func TestCancelledHandshakeIgnoresWelcome(t *testing.T) {
 		t.Fatal("cancelled request installed room credentials")
 	}
 }
+
+func TestTunnelCompressionReducesWireBytes(t *testing.T) {
+	hostAddr, port, stopRelay := startTestRelay(t)
+	defer stopRelay()
+
+	host, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Disconnect()
+	welcome, err := host.CreateRoom("host", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	guest, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Disconnect()
+	received := make(chan []byte, 4)
+	guest.SetDataHandler(func(_ uint8, _, _ uint16, payload []byte) { received <- payload })
+	if _, err := guest.JoinRoom(welcome.RoomCode, "guest", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "peer list", func() bool { return len(host.Peers()) == 2 })
+
+	// Send compressible 1180-byte Civ6-like payload.
+	civPayload := bytes.Repeat([]byte{0x00, 0xf1, 0xd8, 0xff}, 295)
+	beforeBytes := host.Metrics().TunnelTxBytes
+	if !host.SendGameData(3, 62056, 62056, civPayload, false) {
+		t.Fatal("send failed")
+	}
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, civPayload) {
+			t.Fatal("decompressed payload mismatch")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("guest did not receive compressed payload")
+	}
+	sentWire := host.Metrics().TunnelTxBytes - beforeBytes
+	if sentWire >= uint64(len(civPayload)/2) {
+		t.Fatalf("expected wire bytes to be compressed well below half of %d, got %d", len(civPayload), sentWire)
+	}
+}

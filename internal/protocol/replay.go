@@ -3,11 +3,15 @@ package protocol
 import "crypto/rand"
 import "encoding/binary"
 
-// ReplayWindow is a 256-packet sliding replay window, matching the Python
-// implementation's semantics.
+const (
+	replayWindowWords = 16
+	ReplayWindowSize  = replayWindowWords * 64 // 1024 packets
+)
+
+// ReplayWindow is a 1024-packet sliding replay window.
 type ReplayWindow struct {
 	highest     uint64
-	bitmap      [4]uint64
+	bitmap      [replayWindowWords]uint64
 	initialized bool
 }
 
@@ -16,22 +20,22 @@ func (w *ReplayWindow) Accept(sequence uint64) bool {
 	if !w.initialized {
 		w.initialized = true
 		w.highest = sequence
-		w.bitmap = [4]uint64{1}
+		w.bitmap = [replayWindowWords]uint64{1}
 		return true
 	}
 	if sequence > w.highest {
 		shift := sequence - w.highest
-		if shift >= 256 {
-			w.bitmap = [4]uint64{1}
+		if shift >= ReplayWindowSize {
+			w.bitmap = [replayWindowWords]uint64{1}
 		} else {
-			w.bitmap = shiftLeft256(w.bitmap, shift)
+			w.bitmap = shiftLeftWindow(w.bitmap, shift)
 			w.bitmap[0] |= 1
 		}
 		w.highest = sequence
 		return true
 	}
 	distance := w.highest - sequence
-	if distance >= 256 {
+	if distance >= ReplayWindowSize {
 		return false
 	}
 	word := distance / 64
@@ -48,8 +52,8 @@ func (w *ReplayWindow) Reset() {
 	*w = ReplayWindow{}
 }
 
-func shiftLeft256(b [4]uint64, n uint64) [4]uint64 {
-	var out [4]uint64
+func shiftLeftWindow(b [replayWindowWords]uint64, n uint64) [replayWindowWords]uint64 {
+	var out [replayWindowWords]uint64
 	wordShift := int(n / 64)
 	bitShift := uint(n % 64)
 	for i := len(out) - 1; i >= 0; i-- {

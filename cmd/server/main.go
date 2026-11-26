@@ -27,7 +27,7 @@ func main() {
 	var (
 		listen     = flag.String("listen", ":42056", "UDP listen address")
 		maxRooms   = flag.Int("max-rooms", 1024, "maximum concurrent rooms")
-		readers    = flag.Int("readers", 4, "number of UDP reader goroutines")
+		readers    = flag.Int("readers", 1, "number of UDP reader goroutines")
 		quiet      = flag.Bool("quiet", false, "suppress room lifecycle logs")
 		stats      = flag.Duration("stats", time.Minute, "periodic stats interval (0 disables)")
 		showVer    = flag.Bool("version", false, "print version and exit")
@@ -174,8 +174,10 @@ func main() {
 					return
 				case <-ticker.C:
 					rooms, members := srv.Stats()
-					logger.Printf("stats rooms=%d members=%d rx=%d tx=%d rx_errors=%d tx_errors=%d",
-						rooms, members, received.Load(), sent.Load(), readErrors.Load(), sendErrors.Load())
+					drops := srv.DropStats()
+					logger.Printf("stats rooms=%d members=%d rx=%d tx=%d rx_errors=%d tx_errors=%d decode_err=%d unknown_room=%d auth_fail=%d replay_drop=%d rate_drop=%d",
+						rooms, members, received.Load(), sent.Load(), readErrors.Load(), sendErrors.Load(),
+						drops.DecodeErrors, drops.UnknownRoom, drops.AuthFailures, drops.ReplayDrops, drops.RateDrops)
 				}
 			}
 		}()

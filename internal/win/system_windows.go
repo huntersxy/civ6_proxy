@@ -114,6 +114,104 @@ func RouteTo(remote net.IP) (RouteInfo, error) {
 	return info, nil
 }
 
+// SelectLocalRoute resolves the local IPv4 injection route for remote,
+// preferring a physical/non-TUN LAN interface when the default route points to
+// a proxy TUN fake-IP range (198.18.0.0/15).
+func SelectLocalRoute(remote net.IP, excluded ...*net.IPNet) (RouteInfo, bool, error) {
+	route, err := RouteTo(remote)
+	if err != nil {
+		return RouteInfo{}, false, err
+	}
+	if !isTunnelFakeIP(route.LocalIP) {
+		return route, false, nil
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return route, false, nil
+	}
+	if fallback, ok := pickNonTunnelRoute(ifaces, excluded); ok {
+		return fallback, true, nil
+	}
+	return route, false, nil
+}
+
+func isTunnelFakeIP(ip net.IP) bool {
+	v4 := ip.To4()
+	return v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19)
+}
+
+func pickNonTunnelRoute(ifaces []net.Interface, excluded []*net.IPNet) (RouteInfo, bool) {
+	bestPriority := 0
+	var best RouteInfo
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		if isLikelyTunnelInterface(iface.Name) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			v4 := ipnet.IP.To4()
+			if v4 == nil || v4.IsLoopback() || v4.IsLinkLocalUnicast() || isTunnelFakeIP(v4) {
+				continue
+			}
+			skip := false
+			for _, ex := range excluded {
+				if ex != nil && ex.Contains(v4) {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+			priority := localIPPriority(v4)
+			if priority > bestPriority {
+				bestPriority = priority
+				best = RouteInfo{LocalIP: v4, IfIndex: uint32(iface.Index)}
+			}
+		}
+	}
+	return best, bestPriority > 0
+}
+
+func isLikelyTunnelInterface(name string) bool {
+	lower := strings.ToLower(name)
+	for _, token := range []string{"mihomo", "clash", "wintun", "sing-box", "tun", "tap", "wireguard", "tailscale", "radmin", "zerotier"} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func localIPPriority(ip net.IP) int {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0
+	}
+	switch {
+	case v4[0] == 192 && v4[1] == 168:
+		return 4
+	case v4[0] == 10:
+		return 3
+	case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31:
+		return 2
+	case v4.IsGlobalUnicast():
+		return 1
+	default:
+		return 0
+	}
+}
+
 func interfaceIndexForIP(ip net.IP) uint32 {
 	ifaces, err := net.Interfaces()
 	if err != nil {

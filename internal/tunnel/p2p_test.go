@@ -127,12 +127,16 @@ func TestP2PFullMeshAndRoomToggle(t *testing.T) {
 			t.Fatal("game datagram did not arrive")
 		}
 	}
-	transfer(bytes.Repeat([]byte{0xfe, 0xed}, 2000), false)
+	transfer(protocol.RandomBytes(4000), false)
 	if relayData.Load() != 0 || guest.Metrics().DirectTxFrames != 4 || late.Metrics().DirectRxFrames != 4 {
 		t.Fatal("guest-to-guest fragmented datagram did not bypass the relay")
 	}
+	transfer(bytes.Repeat([]byte{0xfe, 0xed}, 2000), false)
+	if relayData.Load() != 0 || guest.Metrics().DirectTxFrames != 5 || late.Metrics().DirectRxFrames != 5 {
+		t.Fatal("compressible guest-to-guest datagram should fit one direct frame")
+	}
 	transfer([]byte("discovery"), true)
-	if relayData.Load() != 1 || late.Metrics().DirectRxFrames != 4 {
+	if relayData.Load() != 1 || late.Metrics().DirectRxFrames != 5 {
 		t.Fatal("broadcast did not stay on the relay")
 	}
 	if err := host.SetP2PEnabled(false); err != nil {
@@ -149,7 +153,7 @@ func TestP2PFullMeshAndRoomToggle(t *testing.T) {
 		t.Fatalf("relay RTT disappeared after disabling direct paths: host=%v guest=%v", host.P2PStatus().RelayRTT, guest.P2PStatus().RelayRTT)
 	}
 	transfer([]byte("relayed after switch-off"), false)
-	if relayData.Load() != 2 || late.Metrics().DirectRxFrames != 4 {
+	if relayData.Load() != 2 || late.Metrics().DirectRxFrames != 5 {
 		t.Fatal("disabled room still used a direct route")
 	}
 }
@@ -209,5 +213,41 @@ func TestP2PProbeTimeoutFallsBackWithoutLeavingTheRoom(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay fallback did not arrive")
+	}
+}
+
+func TestP2PPrefersRelayWhenDirectIsMuchSlower(t *testing.T) {
+	now := time.Now()
+	path := &p2pPath{member: 3, verifiedUntil: now.Add(p2pPathTimeout)}
+	state := &p2pRoom{}
+	state.paths[3] = path
+	state.relayRTT[3] = 50 * time.Millisecond
+
+	// Direct comparable to relay stays direct.
+	path.rtt = 55 * time.Millisecond
+	state.updatePathPreference(3)
+	if !path.activeDirect(now) {
+		t.Fatal("direct path should stay active when close to relay RTT")
+	}
+
+	// Direct clearly slower than relay (> +15ms and > 1.25x) switches to relay.
+	path.rtt = 80 * time.Millisecond
+	state.updatePathPreference(3)
+	if path.activeDirect(now) {
+		t.Fatal("direct path should yield to relay when significantly slower")
+	}
+
+	// Hysteresis: still prefers relay at +10ms until it drops within +5ms.
+	path.rtt = 60 * time.Millisecond
+	state.updatePathPreference(3)
+	if path.activeDirect(now) {
+		t.Fatal("hysteresis should avoid flapping back at +10ms")
+	}
+
+	// Recovers to direct once within +5ms of relay.
+	path.rtt = 54 * time.Millisecond
+	state.updatePathPreference(3)
+	if !path.activeDirect(now) {
+		t.Fatal("direct path should resume once RTT improves")
 	}
 }

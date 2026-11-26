@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"compress/flate"
 	"errors"
 	"strings"
 	"testing"
@@ -173,17 +175,61 @@ func TestReplayWindow(t *testing.T) {
 	if w.Accept(99) {
 		t.Fatal("duplicate out of order accepted")
 	}
-	if !w.Accept(400) {
+	if !w.Accept(1500) {
 		t.Fatal("big jump rejected")
 	}
 	if w.Accept(100) {
 		t.Fatal("old packet accepted after jump")
 	}
-	if !w.Accept(399) {
+	if !w.Accept(1499) {
 		t.Fatal("previous packet rejected after jump")
 	}
-	if w.Accept(144) {
-		t.Fatal("packet exactly 256 behind accepted")
+	if !w.Accept(1500 - ReplayWindowSize + 1) {
+		t.Fatal("packet at inner edge of window rejected")
+	}
+	if w.Accept(1500 - ReplayWindowSize) {
+		t.Fatal("packet at ReplayWindowSize behind accepted")
+	}
+}
+
+func TestCompressorDecompressor(t *testing.T) {
+	comp := NewCompressor()
+	decomp := NewDecompressor()
+
+	// Tiny payloads skip compression.
+	tiny := bytes.Repeat([]byte{'a'}, MinCompressSize-1)
+	if out, ok := comp.Compress(tiny); ok || !bytes.Equal(out, tiny) {
+		t.Fatalf("tiny payload should not compress: ok=%v len=%d", ok, len(out))
+	}
+
+	// Highly compressible Civ6-style payload shrinks and round-trips.
+	civ := bytes.Repeat([]byte{0x00, 0xf1, 0xd8, 0xff}, 295) // 1180 bytes
+	compressed, ok := comp.Compress(civ)
+	if !ok || len(compressed) >= len(civ)/4 {
+		t.Fatalf("expected strong compression: ok=%v compressed=%d raw=%d", ok, len(compressed), len(civ))
+	}
+	wireCopy := bytes.Clone(compressed)
+	restored, err := decomp.Decompress(wireCopy)
+	if err != nil {
+		t.Fatalf("decompress failed: %v", err)
+	}
+	if !bytes.Equal(restored, civ) {
+		t.Fatal("decompressed payload mismatch")
+	}
+
+	// Random incompressible payload is left uncompressed (never expands).
+	rnd := RandomBytes(1180)
+	if out, ok := comp.Compress(rnd); ok || !bytes.Equal(out, rnd) {
+		t.Fatalf("random payload should stay raw: ok=%v len=%d", ok, len(out))
+	}
+
+	// Oversized bomb is rejected.
+	var bombBuf bytes.Buffer
+	w, _ := flate.NewWriter(&bombBuf, flate.BestSpeed)
+	_, _ = w.Write(make([]byte, MaxUDPPayload+1024))
+	_ = w.Close()
+	if _, err := decomp.Decompress(bombBuf.Bytes()); !errors.Is(err, ErrDecompressedTooLarge) {
+		t.Fatalf("expected ErrDecompressedTooLarge, got %v", err)
 	}
 }
 

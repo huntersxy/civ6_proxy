@@ -118,3 +118,18 @@ func TestListProcesses(t *testing.T) {
 	}
 	_ = SecuritySoftware()
 }
+
+func TestTunnelFakeIPAndLocalPriority(t *testing.T) {
+	if !isTunnelFakeIP(net.IPv4(198, 18, 0, 1)) || !isTunnelFakeIP(net.IPv4(198, 19, 255, 254)) {
+		t.Fatal("expected 198.18.0.0/15 to be detected as TUN fake-IP")
+	}
+	if isTunnelFakeIP(net.IPv4(192, 168, 1, 185)) || isTunnelFakeIP(net.IPv4(198, 20, 0, 1)) {
+		t.Fatal("non-TUN IP misclassified as TUN fake-IP")
+	}
+	if localIPPriority(net.IPv4(192, 168, 1, 10)) <= localIPPriority(net.IPv4(172, 16, 0, 1)) {
+		t.Fatal("expected 192.168/16 to outrank 172.16/12")
+	}
+	if !isLikelyTunnelInterface("Mihomo") || !isLikelyTunnelInterface("Wintun Userspace Tunnel") || isLikelyTunnelInterface("Ethernet") {
+		t.Fatal("unexpected tunnel interface classification")
+	}
+}

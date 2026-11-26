@@ -17,12 +17,13 @@ type assemblyKey struct {
 }
 
 type assembly struct {
-	key       assemblyKey
-	createdAt time.Time
-	chunks    [][]byte
-	received  uint64
-	remaining int
-	size      int
+	key        assemblyKey
+	createdAt  time.Time
+	compressed bool
+	chunks     [][]byte
+	received   uint64
+	remaining  int
+	size       int
 }
 
 // Reassembler joins fragmented DATA frames, mirroring the Python client.
@@ -69,20 +70,22 @@ func (r *Reassembler) Add(f *Frame) ([]byte, error) {
 	now := r.now()
 	r.expireLocked(now)
 	key := assemblyKey{f.RoomID, f.SourceMember, f.PacketID, f.SourcePort, f.TargetPort}
+	compressed := f.Flags&FlagCompressed != 0
 	entry := r.entries[key]
 	if entry == nil {
 		if len(r.entries) >= r.max {
 			r.removeLocked(r.order.Front())
 		}
 		entry = r.order.PushBack(&assembly{
-			key: key, createdAt: now, chunks: make([][]byte, f.FragmentCount), remaining: int(f.FragmentCount),
+			key: key, createdAt: now, compressed: compressed,
+			chunks: make([][]byte, f.FragmentCount), remaining: int(f.FragmentCount),
 		})
 		r.entries[key] = entry
 	}
 	a := entry.Value.(*assembly)
-	if len(a.chunks) != int(f.FragmentCount) {
+	if len(a.chunks) != int(f.FragmentCount) || a.compressed != compressed {
 		r.removeLocked(entry)
-		return nil, errors.New("fragment count changed during reassembly")
+		return nil, errors.New("fragment metadata changed during reassembly")
 	}
 	mask := uint64(1) << f.FragmentIndex
 	if a.received&mask != 0 {

@@ -22,8 +22,25 @@ const (
 	handshakeBurst      = 2.0
 
 	DefaultMemberPacketRate = 5000
-	DefaultMemberByteRate   = 1_250_000
+	DefaultMemberByteRate   = 3_750_000
 )
+
+// DropStats reports cumulative server-side packet drops by reason.
+type DropStats struct {
+	DecodeErrors uint64
+	UnknownRoom  uint64
+	AuthFailures uint64
+	ReplayDrops  uint64
+	RateDrops    uint64
+}
+
+type dropCounters struct {
+	decodeErrors atomic.Uint64
+	unknownRoom  atomic.Uint64
+	authFailures atomic.Uint64
+	replayDrops  atomic.Uint64
+	rateDrops    atomic.Uint64
+}
 
 // Config configures a Server. Zero values are replaced with defaults.
 type Config struct {
@@ -46,6 +63,7 @@ type Server struct {
 	roomsByID       map[uint64]*room
 	roomsByCode     map[string]*room
 	memberCount     atomic.Int64
+	drops           dropCounters
 	handshakeMu     sync.Mutex
 	handshakeCache  map[handshakeKey]cachedHandshake
 	handshakeLimits map[netip.Addr]*handshakeLimit
@@ -120,12 +138,15 @@ func (s *Server) HandleInto(datagram []byte, addr netip.AddrPort, batch *Batch) 
 	batch.reset()
 	frame, err := protocol.DecodeView(datagram)
 	if err != nil || !addr.IsValid() {
+		s.drops.decodeErrors.Add(1)
 		return
 	}
 	addr = netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
 	if frame.Kind == protocol.KindCreate || frame.Kind == protocol.KindJoin {
 		if frame.Flags&protocol.FlagAuthenticated == 0 {
 			s.handleHandshake(&frame, addr, len(datagram), batch)
+		} else {
+			s.drops.decodeErrors.Add(1)
 		}
 		return
 	}
@@ -133,9 +154,11 @@ func (s *Server) HandleInto(datagram []byte, addr netip.AddrPort, batch *Batch) 
 	s.roomsMu.RLock()
 	r := s.roomsByID[frame.RoomID]
 	s.roomsMu.RUnlock()
-	if r != nil {
-		s.handleAuthenticated(r, &frame, addr, datagram, batch)
+	if r == nil {
+		s.drops.unknownRoom.Add(1)
+		return
 	}
+	s.handleAuthenticated(r, &frame, addr, datagram, batch)
 }
 
 func (s *Server) allowHandshakeLocked(ip netip.Addr, size int, now float64) bool {
@@ -217,6 +240,17 @@ func (s *Server) Stats() (rooms, members int) {
 	rooms, members = len(s.roomsByID), int(s.memberCount.Load())
 	s.roomsMu.RUnlock()
 	return
+}
+
+// DropStats returns cumulative drop counts by reason.
+func (s *Server) DropStats() DropStats {
+	return DropStats{
+		DecodeErrors: s.drops.decodeErrors.Load(),
+		UnknownRoom:  s.drops.unknownRoom.Load(),
+		AuthFailures: s.drops.authFailures.Load(),
+		ReplayDrops:  s.drops.replayDrops.Load(),
+		RateDrops:    s.drops.rateDrops.Load(),
+	}
 }
 
 func (s *Server) newRoomIDLocked() uint64 {

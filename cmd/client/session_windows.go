@@ -99,6 +99,8 @@ type session struct {
 	p2pFirewallKey   string
 	p2pFirewallBusy  bool
 	p2pFirewallError string
+	peerPaths        [10]tunnel.PeerPath
+	peerPathsKnown   [10]bool
 }
 
 func newSession(capture bool) *session {
@@ -404,13 +406,17 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		s.mu.Unlock()
 		s.notify()
 		var route win.RouteInfo
+		var avoidedTUN bool
 		subnet, err = win.SelectVirtualSubnet(client.RelayAddr().IP)
 		if err != nil {
 			return err
 		}
-		route, err = win.RouteTo(win.VirtualMemberIP(subnet, 2))
+		route, avoidedTUN, err = win.SelectLocalRoute(win.VirtualMemberIP(subnet, 2), subnet)
 		if err != nil {
 			return err
+		}
+		if avoidedTUN {
+			s.logInfo("检测到 TUN 虚拟默认路由，回包注入已自动改用物理局域网出口 %s", route.LocalIP)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -470,6 +476,8 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		s.pcapPath = recorder.Path()
 	}
 	s.state, s.detail, s.cancel = stateJoined, detail, nil
+	s.peerPaths = [10]tunnel.PeerPath{}
+	s.peerPathsKnown = [10]bool{}
 	transferred = true
 	s.mu.Unlock()
 	s.logOK("已进入房间 %s，成员 ID %d", welcome.RoomCode, welcome.MemberID)
@@ -598,6 +606,8 @@ func (s *session) teardownLocked(detail string) {
 		s.pcapPath = recorder.Path()
 	}
 	s.state, s.detail = stateLeaving, "正在离开房间…"
+	s.peerPaths = [10]tunnel.PeerPath{}
+	s.peerPathsKnown = [10]bool{}
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
@@ -738,6 +748,7 @@ func (s *session) Snapshot() sessionSnapshot {
 	snap.RoomCode = client.RoomCode()
 	members := client.Peers()
 	snap.Members = make([]memberView, 0, len(members))
+	var pathChanges []string
 	for _, p := range members {
 		virtual := "—"
 		if subnet != nil {
@@ -753,6 +764,19 @@ func (s *session) Snapshot() sessionSnapshot {
 		if path == tunnel.Direct {
 			latency = snap.P2P.PeerRTT[p.ID]
 		}
+		if int(p.ID) < len(s.peerPaths) && p.ID != client.MemberID() {
+			s.mu.Lock()
+			known := s.peerPathsKnown[p.ID]
+			prev := s.peerPaths[p.ID]
+			if !known || prev != path {
+				s.peerPathsKnown[p.ID] = true
+				s.peerPaths[p.ID] = path
+				if known || path != tunnel.ViaRelay {
+					pathChanges = append(pathChanges, formatPeerPathChange(p.ID, p.Name, path, snap.P2P.PeerRTT[p.ID], snap.P2P.RelayRTT[p.ID]))
+				}
+			}
+			s.mu.Unlock()
+		}
 		snap.Members = append(snap.Members, memberView{
 			ID:      int(p.ID),
 			Name:    p.Name,
@@ -763,7 +787,29 @@ func (s *session) Snapshot() sessionSnapshot {
 			Latency: latency,
 		})
 	}
+	for _, msg := range pathChanges {
+		s.logInfo("%s", msg)
+	}
 	return snap
+}
+
+func formatPeerPathChange(id uint8, name string, path tunnel.PeerPath, directRTT, relayRTT time.Duration) string {
+	label := "中转"
+	switch path {
+	case tunnel.Punching:
+		label = "打洞中"
+	case tunnel.Direct:
+		label = "直连"
+	}
+	return fmt.Sprintf("成员 #%d(%s) 路径切换为 %s（直连 RTT=%s，中转 RTT=%s）",
+		id, name, label, formatOptionalRTT(directRTT), formatOptionalRTT(relayRTT))
+}
+
+func formatOptionalRTT(d time.Duration) string {
+	if d <= 0 {
+		return "—"
+	}
+	return d.Round(time.Millisecond).String()
 }
 
 func (s *session) logEntries(knownSeq int64) ([]logEntry, int64, bool) {
