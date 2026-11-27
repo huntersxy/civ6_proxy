@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"civ6relay/internal/pcap"
@@ -60,6 +61,9 @@ type sessionSnapshot struct {
 	Bridge           win.BridgeStats
 	BridgeRunning    bool
 	Capture          bool
+	HostPCAP         bool
+	HostP2P          bool
+	PCAPActive       bool
 	PCAPPath         string
 	PCAPPackets      uint64
 	PCAPDropped      uint64
@@ -69,8 +73,12 @@ type sessionSnapshot struct {
 }
 
 type session struct {
-	mu      sync.Mutex
-	capture bool
+	mu             sync.Mutex
+	capture        bool
+	hostPCAP       bool
+	hostP2P        bool
+	p2pAutoApplied *tunnel.Client
+	activeRecorder atomic.Pointer[pcap.Recorder]
 
 	client   *tunnel.Client
 	bridge   *win.Bridge
@@ -103,9 +111,11 @@ type session struct {
 	peerPathsKnown   [10]bool
 }
 
-func newSession(capture bool) *session {
+func newSession(capture, hostPCAP, hostP2P bool) *session {
 	s := &session{
 		capture:          capture,
+		hostPCAP:         hostPCAP,
+		hostP2P:          hostP2P,
 		stop:             make(chan struct{}),
 		p2pFirewallReady: make(chan struct{}),
 	}
@@ -219,8 +229,11 @@ func (s *session) logLocation() string {
 // logEnvironment writes startup facts that support needs when diagnosing.
 func (s *session) logEnvironment() {
 	exe, _ := os.Executable()
+	s.mu.Lock()
+	hostPCAP := s.hostPCAP
+	s.mu.Unlock()
 	s.logInfo("Civ6RelayClient %s 启动", version)
-	s.logInfo("系统: %s, 管理员: %v, 抓包: %v", win.OSVersion(), win.IsAdmin(), s.capture)
+	s.logInfo("系统: %s, 管理员: %v, 抓包: %v, 房主抓包: %v", win.OSVersion(), win.IsAdmin(), s.capture, hostPCAP)
 	s.logInfo("程序: %s", exe)
 	s.logInfo("配置: %s", configPath())
 	s.logInfo("日志: %s", s.logLocation())
@@ -323,10 +336,12 @@ func (s *session) Connect(join bool, relayText, nameText, codeText string) error
 	s.detail = "正在联系中转服务器…"
 	s.pcapPath, s.pcapError = "", ""
 	s.pcapPackets, s.pcapDropped = 0, 0
+	hostPCAP := s.hostPCAP
+	hostP2P := s.hostP2P
 	s.work.Add(1)
 	s.mu.Unlock()
 	stored := loadConfig()
-	cfg := Config{RelayHost: host, RelayPort: port, DisplayName: name, RelayHistory: stored.RelayHistory}
+	cfg := Config{RelayHost: host, RelayPort: port, DisplayName: name, RelayHistory: stored.RelayHistory, HostPCAP: hostPCAP, HostP2P: hostP2P}
 	go s.connectWorker(ctx, cancel, cfg, code)
 	s.notify()
 	return nil
@@ -371,6 +386,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	transferred := false
 	defer func() {
 		if !transferred {
+			s.activeRecorder.Store(nil)
 			s.finishCapture(recorder, stopConnection(client, bridge, recorder))
 		}
 	}()
@@ -439,7 +455,10 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if welcome.Host {
+		s.mu.Lock()
+		hostPCAP := s.hostPCAP
+		s.mu.Unlock()
+		if welcome.Host && hostPCAP {
 			recorder, err = pcap.NewRecorder(captureDirectory(), welcome.RoomCode)
 			if err != nil {
 				captureError = err.Error()
@@ -449,13 +468,10 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 				s.logOK("本房间游戏 UDP 已开始记录: %s", recorder.Path())
 			}
 		}
-		var recordPacket func([]byte)
-		if recorder != nil {
-			recordPacket = recorder.Record
-		}
+		s.activeRecorder.Store(recorder)
 		bridge, err = win.StartBridge(client, subnet, route, driverDir, func(level, message string) {
 			s.logAt(upperLevel(level), message)
-		}, recordPacket)
+		}, s.recordPacket)
 		if err != nil {
 			return errors.New(s.driverFailureText(err, driverDir))
 		}
@@ -476,6 +492,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		s.pcapPath = recorder.Path()
 	}
 	s.state, s.detail, s.cancel = stateJoined, detail, nil
+	s.p2pAutoApplied = nil
 	s.peerPaths = [10]tunnel.PeerPath{}
 	s.peerPathsKnown = [10]bool{}
 	transferred = true
@@ -497,14 +514,188 @@ func upperLevel(level string) string {
 	return "INFO"
 }
 
+func (s *session) updateConfig(apply func(*Config) bool) {
+	cfg := loadConfig()
+	if !apply(&cfg) {
+		return
+	}
+	if err := saveConfig(cfg); err != nil {
+		s.logWarn("保存配置失败: %v", err)
+	}
+}
+
+// SetP2PEnabled updates the host P2P preference and, when currently hosting an
+// active room, applies it to the room immediately.
 func (s *session) SetP2PEnabled(enabled bool) error {
 	s.mu.Lock()
-	client := s.client
-	s.mu.Unlock()
-	if client == nil {
-		return errors.New("当前没有房间。")
+	if s.quitting {
+		s.mu.Unlock()
+		return errors.New("程序正在退出。")
 	}
-	return client.SetP2PEnabled(enabled)
+	if s.state == stateConnecting || s.state == stateLeaving {
+		s.mu.Unlock()
+		return errors.New("当前正在切换连接状态，请稍后再试。")
+	}
+	state := s.state
+	client := s.client
+	if state == stateJoined && client != nil {
+		s.mu.Unlock()
+		if err := client.SetP2PEnabled(enabled); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if s.client == client {
+			s.hostP2P = enabled
+			s.p2pAutoApplied = client
+		}
+		s.mu.Unlock()
+		s.updateConfig(func(cfg *Config) bool {
+			if cfg.HostP2P == enabled {
+				return false
+			}
+			cfg.HostP2P = enabled
+			return true
+		})
+		s.notify()
+		return nil
+	}
+	s.hostP2P = enabled
+	s.mu.Unlock()
+
+	s.updateConfig(func(cfg *Config) bool {
+		if cfg.HostP2P == enabled {
+			return false
+		}
+		cfg.HostP2P = enabled
+		return true
+	})
+	s.notify()
+	return nil
+}
+
+func (s *session) maybeAutoEnableP2P(client *tunnel.Client, status tunnel.P2PStatus) tunnel.P2PStatus {
+	if client == nil || !client.IsHost() || !status.Supported {
+		return status
+	}
+	s.mu.Lock()
+	shouldApply := !s.quitting && s.state == stateJoined && s.client == client && s.hostP2P && s.p2pAutoApplied != client
+	if shouldApply {
+		s.p2pAutoApplied = client
+	}
+	s.mu.Unlock()
+	if !shouldApply || status.Enabled || status.Pending {
+		return status
+	}
+	if err := client.SetP2PEnabled(true); err != nil {
+		s.logWarn("按预设自动开启 P2P 直连失败: %v", err)
+		return status
+	}
+	s.logInfo("已按预设偏好自动开启 P2P 直连")
+	return client.P2PStatus()
+}
+
+func (s *session) recordPacket(raw []byte) {
+	if recorder := s.activeRecorder.Load(); recorder != nil {
+		recorder.Record(raw)
+	}
+}
+
+func (s *session) saveHostPCAPConfig(enabled bool) {
+	s.updateConfig(func(cfg *Config) bool {
+		if cfg.HostPCAP == enabled {
+			return false
+		}
+		cfg.HostPCAP = enabled
+		return true
+	})
+}
+
+// SetHostPCAP updates the host auto-capture preference and starts or stops
+// local PCAP recording immediately when currently hosting an active room.
+func (s *session) SetHostPCAP(enabled bool) error {
+	s.mu.Lock()
+	if s.quitting {
+		s.mu.Unlock()
+		return errors.New("程序正在退出。")
+	}
+	if s.state == stateConnecting || s.state == stateLeaving {
+		s.mu.Unlock()
+		return errors.New("当前正在切换连接状态，请稍后再试。")
+	}
+	if s.state == stateJoined && s.client != nil && !s.client.IsHost() {
+		s.mu.Unlock()
+		return errors.New("仅房主可以开关房间抓包。")
+	}
+	s.hostPCAP = enabled
+	state := s.state
+	client := s.client
+	capture := s.capture
+	oldRecorder := s.recorder
+	if state != stateJoined || client == nil || !capture {
+		s.mu.Unlock()
+		s.saveHostPCAPConfig(enabled)
+		s.notify()
+		return nil
+	}
+	if !enabled {
+		s.activeRecorder.Store(nil)
+		s.recorder = nil
+		if oldRecorder != nil {
+			s.pcapPath = oldRecorder.Path()
+			s.work.Add(1)
+		}
+		s.mu.Unlock()
+		s.saveHostPCAPConfig(false)
+		if oldRecorder != nil {
+			go func() {
+				defer s.work.Done()
+				s.finishCapture(oldRecorder, oldRecorder.Close())
+				s.logInfo("已停止本房间游戏 UDP 记录: %s", oldRecorder.Path())
+				s.notify()
+			}()
+		} else {
+			s.notify()
+		}
+		return nil
+	}
+	if oldRecorder != nil {
+		s.activeRecorder.Store(oldRecorder)
+		s.mu.Unlock()
+		s.saveHostPCAPConfig(true)
+		s.notify()
+		return nil
+	}
+	s.pcapError = ""
+	roomCode := client.RoomCode()
+	s.mu.Unlock()
+
+	s.saveHostPCAPConfig(true)
+	recorder, err := pcap.NewRecorder(captureDirectory(), roomCode)
+
+	s.mu.Lock()
+	if err != nil {
+		if s.state == stateJoined && s.client == client {
+			s.pcapError = err.Error()
+		}
+		s.mu.Unlock()
+		s.logWarn("无法创建本地 PCAP 记录: %v", err)
+		s.notify()
+		return err
+	}
+	if s.quitting || s.state != stateJoined || s.client != client || !s.hostPCAP || s.recorder != nil {
+		s.mu.Unlock()
+		_ = recorder.Close()
+		s.notify()
+		return nil
+	}
+	s.recorder = recorder
+	s.pcapPath = recorder.Path()
+	s.pcapPackets, s.pcapDropped, s.pcapError = 0, 0, ""
+	s.activeRecorder.Store(recorder)
+	s.mu.Unlock()
+	s.logOK("本房间游戏 UDP 已开始记录: %s", recorder.Path())
+	s.notify()
+	return nil
 }
 
 func (s *session) RetryP2PFirewall(status tunnel.P2PStatus) error {
@@ -600,6 +791,7 @@ func (s *session) Disconnect() {
 }
 
 func (s *session) teardownLocked(detail string) {
+	s.activeRecorder.Store(nil)
 	client, bridge, recorder := s.client, s.bridge, s.recorder
 	s.client, s.bridge, s.recorder, s.subnet = nil, nil, nil, nil
 	if recorder != nil {
@@ -637,10 +829,12 @@ func (s *session) finishCapture(recorder *pcap.Recorder, closeErr error) {
 	}
 	written, dropped := recorder.Stats()
 	s.mu.Lock()
-	s.pcapPath = recorder.Path()
-	s.pcapPackets, s.pcapDropped = written, dropped
-	if closeErr != nil {
-		s.pcapError = closeErr.Error()
+	if s.recorder == nil || s.recorder == recorder {
+		s.pcapPath = recorder.Path()
+		s.pcapPackets, s.pcapDropped = written, dropped
+		if closeErr != nil {
+			s.pcapError = closeErr.Error()
+		}
 	}
 	s.mu.Unlock()
 	if dropped != 0 {
@@ -679,6 +873,9 @@ func (s *session) onTunnelEvent(client *tunnel.Client, ev tunnel.Event) {
 	if ev.Type == tunnel.EventTransportError && ev.Err != nil {
 		s.logError("网络错误: %v", ev.Err)
 	}
+	if ev.Type == tunnel.EventP2P && client.IsHost() {
+		s.maybeAutoEnableP2P(client, client.P2PStatus())
+	}
 	s.notify()
 }
 
@@ -694,6 +891,7 @@ func (s *session) Shutdown() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.activeRecorder.Store(nil)
 	client, bridge, recorder := s.client, s.bridge, s.recorder
 	s.client, s.bridge, s.recorder, s.subnet = nil, nil, nil, nil
 	if recorder != nil {
@@ -714,8 +912,9 @@ func (s *session) Shutdown() {
 func (s *session) Snapshot() sessionSnapshot {
 	s.mu.Lock()
 	snap := sessionSnapshot{
-		State: s.state, Detail: s.detail, Capture: s.capture, CivRunning: s.civRunning,
+		State: s.state, Detail: s.detail, Capture: s.capture, HostPCAP: s.hostPCAP, HostP2P: s.hostP2P, CivRunning: s.civRunning,
 		P2PFirewallError: s.p2pFirewallError,
+		PCAPActive:       s.recorder != nil,
 		PCAPPath:         s.pcapPath, PCAPPackets: s.pcapPackets, PCAPDropped: s.pcapDropped, PCAPError: s.pcapError,
 	}
 	subnet := s.subnet
@@ -744,7 +943,7 @@ func (s *session) Snapshot() sessionSnapshot {
 	snap.Tunnel = client.Metrics()
 	snap.MemberID = int(client.MemberID())
 	snap.Host = client.IsHost()
-	snap.P2P = client.P2PStatus()
+	snap.P2P = s.maybeAutoEnableP2P(client, client.P2PStatus())
 	snap.RoomCode = client.RoomCode()
 	members := client.Peers()
 	snap.Members = make([]memberView, 0, len(members))

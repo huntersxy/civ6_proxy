@@ -33,6 +33,7 @@ const (
 	EventPeers          EventType = "peers"
 	EventRoomClosed     EventType = "room_closed"
 	EventRTT            EventType = "rtt"
+	EventP2P            EventType = "p2p"
 	EventTransportError EventType = "transport_error"
 	EventDisconnected   EventType = "disconnected"
 )

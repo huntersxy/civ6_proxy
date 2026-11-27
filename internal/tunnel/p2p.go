@@ -184,8 +184,8 @@ func (c *Client) handleP2PState(room *clientRoom, frame *protocol.Frame) {
 		return
 	}
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 	if c.closed.Load() || c.room.Load() != room || frame.Sequence <= room.p2p.seq {
+		c.sendMu.Unlock()
 		return
 	}
 	state := &room.p2p
@@ -195,8 +195,10 @@ func (c *Client) handleP2PState(room *clientRoom, frame *protocol.Frame) {
 		state.proof = reply.Challenge
 		state.nextPoll = time.Time{}
 		c.wakeP2P()
+		c.sendMu.Unlock()
 		return
 	}
+	prevSupported, prevEnabled := state.supported, state.enabled
 	state.supported, state.enabled, state.proof = true, reply.Enabled, nil
 	if state.mode != protocol.P2PPoll && state.modeSeq != 0 && reply.Request >= state.modeSeq &&
 		reply.Enabled == (state.mode == protocol.P2POn) {
@@ -224,6 +226,10 @@ func (c *Client) handleP2PState(room *clientRoom, frame *protocol.Frame) {
 		}
 	}
 	state.paths = paths
+	c.sendMu.Unlock()
+	if !prevSupported || prevEnabled != reply.Enabled {
+		c.emit(Event{Type: EventP2P})
+	}
 }
 
 func (c *Client) validPeerAddress(addr netip.AddrPort) bool {

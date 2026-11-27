@@ -3,13 +3,18 @@
 package main
 
 import (
+	"context"
 	"image/png"
+	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"civ6relay/internal/playtest"
+	"civ6relay/internal/relay"
 	"civ6relay/internal/speedtest"
 	"civ6relay/internal/tunnel"
 
@@ -39,8 +44,8 @@ func newTestClientWindow(t *testing.T, dark bool) (*gui.Window, *clientApp) {
 	lightTheme, darkTheme := civ6Themes()
 	w := gui.NewTestWindow(t, gui.WindowCfg{
 		Title:  uiTitle,
-		Width:  980,
-		Height: 680,
+		Width:  1020,
+		Height: 700,
 		State:  app,
 		OnInit: func(win *gui.Window) {
 			if dark {
@@ -55,6 +60,21 @@ func newTestClientWindow(t *testing.T, dark bool) (*gui.Window, *clientApp) {
 	})
 	w.TestRender(nil)
 	return w, app
+}
+
+func TestClientThemesUseReadableFontScale(t *testing.T) {
+	light, dark := civ6Themes()
+	for _, theme := range []gui.Theme{light, dark} {
+		if theme.TextStyleDef.Size != uiFontSize || theme.TextStyleBody.Size != uiFontSize {
+			t.Fatalf("%s body font size = %.1f/%.1f, want %.1f", theme.Name, theme.TextStyleDef.Size, theme.TextStyleBody.Size, uiFontSize)
+		}
+		if theme.TextStyleCaption.Size < 12 {
+			t.Fatalf("%s caption font size = %.1f, want >= 12", theme.Name, theme.TextStyleCaption.Size)
+		}
+		if theme.TextStyleCodeSmall.Size < 13 {
+			t.Fatalf("%s code small font size = %.1f, want >= 13", theme.Name, theme.TextStyleCodeSmall.Size)
+		}
+	}
 }
 
 func TestClientUINavigationAndThemes(t *testing.T) {
@@ -183,6 +203,183 @@ func TestClientUIJoinedLobbyState(t *testing.T) {
 	if copied != "K7M2P9Q4X8" {
 		t.Fatalf("expected clipboard K7M2P9Q4X8, got %q", copied)
 	}
+}
+
+func TestHostPCAPSwitchDefaultsOffAndToggles(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	if app.hostPCAP {
+		t.Fatal("expected hostPCAP to default to false")
+	}
+
+	switches := w.ResolveID("host-pcap-switch")
+	if len(switches) != 1 {
+		t.Fatalf("expected 1 host-pcap-switch, got %v", switches)
+	}
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click host-pcap-switch on: %v", err)
+	}
+	w.TestRender(nil)
+	if !app.hostPCAP {
+		t.Fatal("expected hostPCAP to toggle to true")
+	}
+
+	switches = w.ResolveID("host-pcap-switch")
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click host-pcap-switch off: %v", err)
+	}
+	w.TestRender(nil)
+	if app.hostPCAP {
+		t.Fatal("expected hostPCAP to toggle back to false")
+	}
+
+	// While joined as a non-host member, clicking the disabled switch must not toggle.
+	app.snap = sessionSnapshot{
+		State:    stateJoined,
+		RoomCode: "K7M2P9Q4X8",
+		MemberID: 2,
+		Host:     false,
+		Capture:  true,
+	}
+	app.activeCode = "K7M2P9Q4X8"
+	w.TestRender(nil)
+	switches = w.ResolveID("host-pcap-switch")
+	_ = w.TestClick(switches[0])
+	if app.hostPCAP {
+		t.Fatal("expected disabled host-pcap-switch not to toggle when non-host")
+	}
+}
+
+func TestSessionSetHostPCAPPersistsAndDefaultsOff(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	s := &session{
+		capture:          true,
+		stop:             make(chan struct{}),
+		p2pFirewallReady: make(chan struct{}),
+	}
+	if s.Snapshot().HostPCAP {
+		t.Fatal("expected session HostPCAP to default to false")
+	}
+	if err := s.SetHostPCAP(true); err != nil {
+		t.Fatalf("SetHostPCAP(true): %v", err)
+	}
+	if !s.Snapshot().HostPCAP {
+		t.Fatal("expected session Snapshot().HostPCAP to be true")
+	}
+	if !loadConfig().HostPCAP {
+		t.Fatal("expected config HostPCAP to persist as true")
+	}
+	if err := s.SetHostPCAP(false); err != nil {
+		t.Fatalf("SetHostPCAP(false): %v", err)
+	}
+	if s.Snapshot().HostPCAP || loadConfig().HostPCAP {
+		t.Fatal("expected HostPCAP to persist as false")
+	}
+}
+
+func TestHostP2PSwitchPreRoomTogglesAndPersists(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	if app.hostP2P {
+		t.Fatal("expected hostP2P to default to false")
+	}
+
+	switches := w.ResolveID("p2p-switch")
+	if len(switches) != 1 {
+		t.Fatalf("expected 1 p2p-switch, got %v", switches)
+	}
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click p2p-switch on before joining: %v", err)
+	}
+	w.TestRender(nil)
+	if !app.hostP2P {
+		t.Fatal("expected hostP2P to toggle to true before joining")
+	}
+
+	switches = w.ResolveID("p2p-switch")
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click p2p-switch off before joining: %v", err)
+	}
+	w.TestRender(nil)
+	if app.hostP2P {
+		t.Fatal("expected hostP2P to toggle back to false")
+	}
+
+	// While joined as a non-host member, clicking the disabled switch must not toggle.
+	app.snap = sessionSnapshot{
+		State:    stateJoined,
+		RoomCode: "K7M2P9Q4X8",
+		MemberID: 2,
+		Host:     false,
+		P2P:      tunnel.P2PStatus{Supported: true, Enabled: false},
+	}
+	app.activeCode = "K7M2P9Q4X8"
+	w.TestRender(nil)
+	switches = w.ResolveID("p2p-switch")
+	_ = w.TestClick(switches[0])
+	if app.hostP2P {
+		t.Fatal("expected disabled p2p-switch not to toggle when non-host")
+	}
+}
+
+func TestSessionHostP2PPreferenceAutoEnablesOnCreateRoom(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	srv := relay.New(relay.Config{Logger: log.New(io.Discard, "", 0)})
+	go func() {
+		buf := make([]byte, 2048)
+		var batch relay.Batch
+		for {
+			n, peer, err := conn.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			srv.HandleInto(buf[:n], peer, &batch)
+			for _, out := range batch.Datagrams {
+				_, _ = conn.WriteToUDPAddrPort(out.Data, out.Addr)
+			}
+		}
+	}()
+	addr := conn.LocalAddr().(*net.UDPAddr)
+
+	s := &session{
+		capture:          false,
+		stop:             make(chan struct{}),
+		p2pFirewallReady: make(chan struct{}),
+	}
+	if err := s.SetP2PEnabled(true); err != nil {
+		t.Fatalf("pre-room SetP2PEnabled(true): %v", err)
+	}
+	if !s.Snapshot().HostP2P || !loadConfig().HostP2P {
+		t.Fatal("expected HostP2P preference to persist as true")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.openRoom(ctx, Config{RelayHost: "127.0.0.1", RelayPort: addr.Port, DisplayName: "房主", HostP2P: true}, ""); err != nil {
+		t.Fatalf("openRoom: %v", err)
+	}
+	defer func() {
+		s.mu.Lock()
+		c := s.client
+		s.client = nil
+		s.mu.Unlock()
+		if c != nil {
+			c.Disconnect()
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := s.Snapshot()
+		if snap.P2P.Supported && snap.P2P.Enabled && !snap.P2P.Pending {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected P2P to auto-enable after room creation, got %+v", s.Snapshot().P2P)
 }
 
 func TestCanJoinWithDraft(t *testing.T) {

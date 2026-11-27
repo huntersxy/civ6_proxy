@@ -130,9 +130,9 @@ sudo systemctl restart civ6relay
 
 | 用途 | 路径 | 说明 |
 | --- | --- | --- |
-| 配置文件 | `%APPDATA%\Civ6Relay\config.json` | 持久化中转地址、昵称与建房历史；房间码与令牌仅驻留内存 |
+| 配置文件 | `%APPDATA%\Civ6Relay\config.json` | 持久化中转地址、昵称、建房历史与房主 P2P / 抓包开关；房间码与令牌仅驻留内存 |
 | 运行日志 | `%LOCALAPPDATA%\Civ6Relay\logs\client-YYYYMMDD.log` | UTF-8 BOM，含启动环境、驱动检查与错误记录 |
-| 房主抓包 | `%LOCALAPPDATA%\Civ6Relay\captures\*.pcap` | 仅房主记录原始 IPv4/UDP 游戏包（不含控制帧），按小时轮转，自动保留 72 小时 |
+| 房主抓包 | `%LOCALAPPDATA%\Civ6Relay\captures\*.pcap` | 默认关闭，可在大厅开关开启；仅房主记录原始 IPv4/UDP 游戏包（不含控制帧），按小时轮转，自动保留 72 小时 |
 | 驱动目录 | `%ProgramData%\Civ6Relay\windivert-2.2.2\` | 运行时从 exe 释放 WinDivert DLL/SYS 与许可证 |
 | 诊断报告 | `%TEMP%\Civ6RelayDiag.txt` | 界面诊断或 `-diag` 参数生成 |
 

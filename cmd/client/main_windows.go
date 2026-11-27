@@ -57,7 +57,7 @@ func main() {
 	}
 
 	cfg := loadConfig()
-	s := newSession(!*noCapture)
+	s := newSession(!*noCapture, cfg.HostPCAP, cfg.HostP2P)
 	defer s.CloseLog()
 	if err := runNativeUI(s, cfg); err != nil {
 		s.logError("创建主窗口失败: %v", err)

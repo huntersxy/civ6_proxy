@@ -23,6 +23,8 @@ type Config struct {
 	RelayPort    int      `json:"relay_port"`
 	DisplayName  string   `json:"display_name"`
 	RelayHistory []string `json:"relay_history,omitempty"`
+	HostPCAP     bool     `json:"host_pcap,omitempty"`
+	HostP2P      bool     `json:"host_p2p,omitempty"`
 }
 
 const maxRelayHistory = 20
@@ -57,6 +59,8 @@ func loadConfig() Config {
 		cfg.DisplayName = name
 	}
 	cfg.RelayHistory = normalizeRelayHistory(stored.RelayHistory)
+	cfg.HostPCAP = stored.HostPCAP
+	cfg.HostP2P = stored.HostP2P
 	return cfg
 }
 

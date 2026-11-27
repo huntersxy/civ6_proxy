@@ -58,6 +58,8 @@ type clientApp struct {
 	// Cached session snapshot & log entries
 	snap       sessionSnapshot
 	prevState  connectionState
+	hostPCAP   bool
+	hostP2P    bool
 	logEntries []logEntry
 	logSeq     int64
 	autoScroll bool
@@ -82,6 +84,8 @@ func newClientApp(s *session, cfg Config) *clientApp {
 		relayText:    win.FormatRelay(cfg.RelayHost, cfg.RelayPort),
 		relayHistory: append([]string(nil), cfg.RelayHistory...),
 		nameText:     cfg.DisplayName,
+		hostPCAP:     cfg.HostPCAP,
+		hostP2P:      cfg.HostP2P,
 		autoScroll:   true,
 	}
 	app.netTest.init()
@@ -89,6 +93,8 @@ func newClientApp(s *session, cfg Config) *clientApp {
 	if s != nil {
 		app.snap = s.Snapshot()
 		app.prevState = app.snap.State
+		app.hostPCAP = app.snap.HostPCAP
+		app.hostP2P = app.snap.HostP2P
 		if entries, seq, ok := s.logEntries(-1); ok {
 			app.logEntries = entries
 			app.logSeq = seq
@@ -108,10 +114,10 @@ func runNativeUI(s *session, cfg Config) error {
 	w = gui.NewWindow(gui.WindowCfg{
 		Title:             uiTitle,
 		IconPNG:           appIconPNG,
-		Width:             980,
-		Height:            680,
-		MinWidth:          820,
-		MinHeight:         560,
+		Width:             1020,
+		Height:            700,
+		MinWidth:          860,
+		MinHeight:         600,
 		EnableTextHinting: true,
 		State:             app,
 		OnInit: func(win *gui.Window) {
@@ -213,6 +219,8 @@ func (a *clientApp) syncSnapshot(w *gui.Window) {
 	prevState := a.prevState
 	a.snap = snap
 	a.prevState = snap.State
+	a.hostPCAP = snap.HostPCAP
+	a.hostP2P = snap.HostP2P
 
 	if snap.State == stateJoined && snap.RoomCode != "" {
 		a.activeCode = snap.RoomCode
@@ -649,7 +657,7 @@ func (a *clientApp) statusMeta() (title, detail string, variant gui.BadgeVariant
 		default:
 			if snap.PCAPError != "" {
 				detail = "本地 PCAP 记录异常，请查看运行日志。"
-			} else if snap.Host && snap.PCAPPath != "" {
+			} else if snap.Host && snap.PCAPActive && snap.PCAPPath != "" {
 				detail = fmt.Sprintf("房主端正在记录游戏 UDP（%d 包），自动保留最近 3 天。", snap.PCAPPackets)
 			}
 			if detail == "" {
@@ -928,7 +936,7 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 
 	return gui.Column(gui.ContainerCfg{
 		ID:         "nav-rail",
-		Width:      210,
+		Width:      224,
 		Sizing:     gui.FixedFill,
 		Color:      t.ColorPanel,
 		Padding:    gui.NewPadding(18, 14, 14, 14),

@@ -6,24 +6,35 @@ import (
 	"github.com/go-gui-org/go-gui/gui"
 )
 
-const uiFontFamily = "Microsoft YaHei UI"
+const (
+	uiFontFamily         = "Microsoft YaHei UI"
+	uiFontSize   float32 = 15
+)
+
+func civ6ThemeCfg(baseName, name string) gui.ThemeCfg {
+	base, ok := gui.ThemeGet(baseName)
+	if !ok {
+		base = gui.CurrentTheme()
+	}
+	cfg := base.Cfg
+	cfg.Name = name
+	cfg.TextStyleDef.Family = uiFontFamily
+	cfg.TextStyleDef.Size = uiFontSize
+	// Clear preset ladder rungs so ThemeMaker derives every text role
+	// (Title, Body, Caption, CodeSmall) proportionally from uiFontSize.
+	cfg.SizeTextTiny = 0
+	cfg.SizeTextXSmall = 0
+	cfg.SizeTextSmall = 0
+	cfg.SizeTextMedium = 0
+	cfg.SizeTextLarge = 0
+	cfg.SizeTextXLarge = 0
+	return cfg
+}
 
 // civ6Themes builds the light and dark WinUI-based themes accented with
 // Civilization VI warm bronze/gold tones and unified Microsoft YaHei UI font.
 func civ6Themes() (light, dark gui.Theme) {
-	baseLight, ok := gui.ThemeGet("windows")
-	if !ok {
-		baseLight = gui.CurrentTheme()
-	}
-	baseDark, ok := gui.ThemeGet("windows-dark")
-	if !ok {
-		baseDark = gui.CurrentTheme()
-	}
-
-	lightCfg := baseLight.Cfg
-	lightCfg.Name = "civ6-light"
-	lightCfg.TextStyleDef.Family = uiFontFamily
-	lightCfg.TextStyleDef.Size = 13
+	lightCfg := civ6ThemeCfg("windows", "civ6-light")
 	light = gui.ThemeMaker(lightCfg).WithColors(gui.ColorOverrides{
 		ColorBackground:  gui.Hex(0xF4F2EE),
 		ColorPanel:       gui.Hex(0xFFFFFF),
@@ -42,10 +53,7 @@ func civ6Themes() (light, dark gui.Theme) {
 	})
 	light.Name = "civ6-light"
 
-	darkCfg := baseDark.Cfg
-	darkCfg.Name = "civ6-dark"
-	darkCfg.TextStyleDef.Family = uiFontFamily
-	darkCfg.TextStyleDef.Size = 13
+	darkCfg := civ6ThemeCfg("windows-dark", "civ6-dark")
 	dark = gui.ThemeMaker(darkCfg).WithColors(gui.ColorOverrides{
 		ColorBackground:  gui.Hex(0x1A1C20),
 		ColorPanel:       gui.Hex(0x23262C),
