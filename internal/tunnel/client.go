@@ -90,6 +90,10 @@ type counters struct {
 // DataHandler receives complete game datagrams and owns the payload.
 type DataHandler func(sourceMember uint8, sourcePort, targetPort uint16, payload []byte)
 
+// AuxHandler receives complete authenticated sideband payloads sent over the
+// reserved zero-port channel and owns the payload.
+type AuxHandler func(sourceMember uint8, payload []byte)
+
 // Client is a relay tunnel client.
 type Client struct {
 	conn  *net.UDPConn
@@ -109,6 +113,7 @@ type Client struct {
 
 	handlerMu    sync.RWMutex
 	dataHandler  DataHandler
+	auxHandler   AuxHandler
 	eventHandler func(Event)
 
 	counter counters
@@ -203,6 +208,13 @@ func (c *Client) SetDataHandler(h DataHandler) {
 	c.handlerMu.Unlock()
 }
 
+// SetAuxHandler installs the sideband payload callback.
+func (c *Client) SetAuxHandler(h AuxHandler) {
+	c.handlerMu.Lock()
+	c.auxHandler = h
+	c.handlerMu.Unlock()
+}
+
 // SetEventHandler installs the asynchronous event callback.
 func (c *Client) SetEventHandler(h func(Event)) {
 	c.handlerMu.Lock()
@@ -245,6 +257,18 @@ func (c *Client) MaxMembers() int {
 	room := c.room.Load()
 	if room != nil {
 		return room.maxMembers
+	}
+	return 0
+}
+
+// HostMemberID returns the member ID of the current room host, or 0 if unknown.
+func (c *Client) HostMemberID() uint8 {
+	if room := c.room.Load(); room != nil {
+		for _, p := range *room.peers.Load() {
+			if p.Host {
+				return p.ID
+			}
+		}
 	}
 	return 0
 }
@@ -389,6 +413,20 @@ func handshakeContextError(err error) error {
 
 // SendGameData forwards one game datagram to a member (or the whole room).
 func (c *Client) SendGameData(targetMember uint8, sourcePort, targetPort uint16, payload []byte, broadcast bool) bool {
+	return c.sendData(targetMember, sourcePort, targetPort, payload, broadcast, true)
+}
+
+// SendAuxData forwards one authenticated sideband payload to a specific member
+// over the reserved zero-port channel, reusing compression and P2P direct paths
+// without counting as game traffic or touching the WinDivert bridge.
+func (c *Client) SendAuxData(targetMember uint8, payload []byte) bool {
+	if !validMember(targetMember) {
+		return false
+	}
+	return c.sendData(targetMember, 0, 0, payload, false, false)
+}
+
+func (c *Client) sendData(targetMember uint8, sourcePort, targetPort uint16, payload []byte, broadcast, countGame bool) bool {
 	if len(payload) > protocol.MaxUDPPayload {
 		c.counter.dropped.Add(1)
 		return false
@@ -445,7 +483,9 @@ func (c *Client) SendGameData(targetMember uint8, sourcePort, targetPort uint16,
 			return false
 		}
 	}
-	c.counter.gameTxDatagrams.Add(1)
+	if countGame {
+		c.counter.gameTxDatagrams.Add(1)
+	}
 	return true
 }
 
@@ -731,6 +771,15 @@ func (c *Client) deliverGameData(room *clientRoom, frame *protocol.Frame) {
 		}
 	} else if frame.FragmentCount == 1 {
 		payload = bytes.Clone(payload)
+	}
+	if frame.SourcePort == 0 && frame.TargetPort == 0 {
+		c.handlerMu.RLock()
+		ah := c.auxHandler
+		c.handlerMu.RUnlock()
+		if ah != nil {
+			ah(frame.SourceMember, payload)
+		}
+		return
 	}
 	c.counter.gameRxDatagrams.Add(1)
 	c.handlerMu.RLock()

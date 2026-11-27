@@ -51,9 +51,13 @@ func TestHostPCAPDefaultsOffAndPersists(t *testing.T) {
 	if cfg.HostPCAP {
 		t.Fatalf("expected legacy config without host_pcap to default to false")
 	}
+	if cfg.HostLogSync {
+		t.Fatalf("expected legacy config without host_log_sync to default to false")
+	}
 
 	cfg.HostPCAP = true
 	cfg.HostP2P = true
+	cfg.HostLogSync = true
 	cfg.MaxMembers = 12
 	if err := saveConfig(cfg); err != nil {
 		t.Fatal(err)
@@ -64,6 +68,9 @@ func TestHostPCAPDefaultsOffAndPersists(t *testing.T) {
 	}
 	if !reloaded.HostP2P {
 		t.Fatalf("expected saved HostP2P=true to persist")
+	}
+	if !reloaded.HostLogSync {
+		t.Fatalf("expected saved HostLogSync=true to persist")
 	}
 	if reloaded.MaxMembers != 12 {
 		t.Fatalf("expected saved MaxMembers=12 to persist, got %d", reloaded.MaxMembers)

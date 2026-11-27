@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"civ6relay/internal/logsync"
 	"civ6relay/internal/tunnel"
 
 	"github.com/go-gui-org/go-gui/gui"
@@ -669,6 +670,96 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 		},
 	})
 
+	hostLogSyncSelected := a.hostLogSync
+	canToggleLogSync := !a.closing && !a.diag.busy && snap.State != stateConnecting && snap.State != stateLeaving
+	logSyncStatus := "关闭"
+	logSyncStyle := t.TextStyleSecondary
+	if joined {
+		if !snap.Host {
+			canToggleLogSync = false
+			hostLogSyncSelected = snap.LogGuest.Active
+			if snap.LogGuest.Active {
+				logSyncStatus = fmt.Sprintf("向房主实时上传 · %d 文件 · %s",
+					snap.LogGuest.FilesSynced, logsync.FormatByteSize(snap.LogGuest.BytesSent))
+				logSyncStyle = t.TextStyleSuccess
+			} else {
+				logSyncStatus = "房主未开"
+			}
+		} else {
+			switch {
+			case snap.LogSyncError != "":
+				logSyncStatus = "收集异常"
+				logSyncStyle = t.TextStyleError
+			case hostLogSyncSelected && snap.LogHost.Enabled:
+				if snap.LogHost.OnlineGuests > 0 {
+					logSyncStatus = fmt.Sprintf("收集中 · 房主 + %d/%d 队友 · %s",
+						snap.LogHost.ActivePeers, snap.LogHost.OnlineGuests, logsync.FormatByteSize(snap.LogHost.TotalBytes))
+				} else {
+					logSyncStatus = fmt.Sprintf("收集中 · 房主本机 · %d 文件 · %s",
+						snap.LogHost.HostFiles, logsync.FormatByteSize(snap.LogHost.HostBytes))
+				}
+				logSyncStyle = t.TextStyleSuccess
+			case hostLogSyncSelected:
+				logSyncStatus = "准备中…"
+			case snap.LogSyncDir != "":
+				logSyncStatus = fmt.Sprintf("已停止 · %d 文件 · %s",
+					snap.LogHost.TotalFiles, logsync.FormatByteSize(snap.LogHost.TotalBytes))
+			default:
+				logSyncStatus = "关闭"
+			}
+		}
+	} else if hostLogSyncSelected {
+		logSyncStatus = "开启（建房自动收集）"
+		logSyncStyle = t.TextStyleSuccess
+	}
+
+	logSyncRow := gui.Row(gui.ContainerCfg{
+		Sizing:     gui.FillFit,
+		Padding:    gui.NoPadding,
+		SizeBorder: gui.NoBorder,
+		Spacing:    gui.SpacingMedium,
+		VAlign:     gui.VAlignMiddle,
+		Content: []gui.View{
+			gui.Switch(gui.SwitchCfg{
+				ID:       "host-logsync-switch",
+				Label:    "日志收集",
+				Selected: hostLogSyncSelected,
+				Disabled: !canToggleLogSync,
+				OnClick: func(ctx gui.EventCtx) {
+					ctx.Consume()
+					app := gui.State[clientApp](ctx.Window)
+					next := !app.hostLogSync
+					if app.s == nil {
+						app.hostLogSync = next
+						app.snap.HostLogSync = next
+						ctx.Window.InvalidateLayout()
+						return
+					}
+					if err := app.s.SetHostLogSync(next); err != nil {
+						app.toast(ctx.Window, gui.ToastWarning, "日志收集设置失败", err.Error())
+					}
+					app.syncSnapshot(ctx.Window)
+				},
+			}),
+			gui.Text(gui.TextCfg{
+				Text:      logSyncStatus,
+				TextStyle: logSyncStyle,
+				Mode:      gui.TextModeWrap,
+				Sizing:    gui.FillFit,
+			}),
+			gui.Button(gui.ButtonCfg{
+				ID:       "host-logsync-dir",
+				Label:    "收集目录",
+				Variant:  gui.ButtonSecondary,
+				Disabled: a.closing,
+				OnClick: func(ctx gui.EventCtx) {
+					ctx.Consume()
+					gui.State[clientApp](ctx.Window).openCollectedLogsDir(ctx.Window, true)
+				},
+			}),
+		},
+	})
+
 	return gui.Column(gui.ContainerCfg{
 		ID:          "p2p-card",
 		Sizing:      gui.FillFit,
@@ -682,6 +773,8 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 			p2pRow,
 			gui.Separator(gui.SeparatorCfg{}),
 			pcapRow,
+			gui.Separator(gui.SeparatorCfg{}),
+			logSyncRow,
 		},
 	})
 }

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"civ6relay/internal/logsync"
 	"civ6relay/internal/protocol"
 	"civ6relay/internal/win"
 
@@ -30,6 +31,7 @@ const (
 	pageLobby navPage = iota
 	pageNetTest
 	pageDiagLog
+	pageModPatch
 )
 
 type diagState struct {
@@ -57,24 +59,30 @@ type clientApp struct {
 	activeCode     string
 
 	// Cached session snapshot & log entries
-	snap       sessionSnapshot
-	prevState  connectionState
-	hostPCAP   bool
-	hostP2P    bool
-	logEntries []logEntry
-	logSeq     int64
-	autoScroll bool
+	snap        sessionSnapshot
+	prevState   connectionState
+	hostPCAP    bool
+	hostP2P     bool
+	hostLogSync bool
+	logEntries  []logEntry
+	logSeq      int64
+	autoScroll  bool
 
 	// Transient states
 	closing         bool
 	exportBusy      bool
-	diag            diagState
-	netTest         netTestState
-	syncFixMod      syncFixModStatus
-	openPathFn      func(string) error     // optional test override for openFolder
-	openURLFn       func(string) error     // optional test override for openURL
-	modsRootFn      func() (string, error) // optional test override for defaultCiv6ModsRoot
-	workshopRootsFn func() []string        // optional test override for defaultSteamLibraryRoots
+	diag             diagState
+	netTest          netTestState
+	syncFixMod       syncFixModStatus
+	modPatches       []modPatchStatus
+	modPatchExpanded map[string]bool
+	modPatchNotice   string
+	openPathFn       func(string) error     // optional test override for openFolder
+	openURLFn        func(string) error     // optional test override for openURL
+	modsRootFn       func() (string, error) // optional test override for defaultCiv6ModsRoot
+	workshopRootsFn  func() []string        // optional test override for defaultSteamLibraryRoots
+	patchBackupDirFn func() string          // optional test override for modPatchBackupRoot
+	modPatchSpecsFn  func() []modPatchSpec  // optional test override for modPatchSpecs
 
 	refreshQueued atomic.Bool
 	stopped       atomic.Bool
@@ -94,15 +102,19 @@ func newClientApp(s *session, cfg Config) *clientApp {
 		maxMembersText: maxMembersText,
 		hostPCAP:       cfg.HostPCAP,
 		hostP2P:        cfg.HostP2P,
-		autoScroll:     true,
+		hostLogSync:      cfg.HostLogSync,
+		autoScroll:       true,
+		modPatchExpanded: make(map[string]bool),
 	}
 	app.netTest.init()
 	app.refreshSyncFixStatus()
+	app.refreshModPatches()
 	if s != nil {
 		app.snap = s.Snapshot()
 		app.prevState = app.snap.State
 		app.hostPCAP = app.snap.HostPCAP
 		app.hostP2P = app.snap.HostP2P
+		app.hostLogSync = app.snap.HostLogSync
 		if entries, seq, ok := s.logEntries(-1); ok {
 			app.logEntries = entries
 			app.logSeq = seq
@@ -229,6 +241,7 @@ func (a *clientApp) syncSnapshot(w *gui.Window) {
 	a.prevState = snap.State
 	a.hostPCAP = snap.HostPCAP
 	a.hostP2P = snap.HostP2P
+	a.hostLogSync = snap.HostLogSync
 
 	if snap.State == stateJoined && snap.RoomCode != "" {
 		a.activeCode = snap.RoomCode
@@ -372,6 +385,21 @@ func (a *clientApp) openCapturesDir(w *gui.Window) {
 	a.openPath(w, dir)
 }
 
+func (a *clientApp) openCollectedLogsDir(w *gui.Window, preferSession bool) {
+	dir := collectedLogsDirectory()
+	if preferSession && a.snap.LogSyncDir != "" {
+		if info, err := os.Stat(a.snap.LogSyncDir); err == nil && info.IsDir() {
+			a.openPath(w, a.snap.LogSyncDir)
+			return
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		a.toast(w, gui.ToastError, "打开失败", err.Error())
+		return
+	}
+	a.openPath(w, dir)
+}
+
 func (a *clientApp) modsRoot() (string, error) {
 	if a.modsRootFn != nil {
 		return a.modsRootFn()
@@ -463,6 +491,118 @@ func (a *clientApp) uninstallSyncFixFromUI(w *gui.Window) {
 	}
 	w.DialogDismiss()
 	w.InvalidateLayout()
+}
+
+func (a *clientApp) patchBackupRootDir() string {
+	if a.patchBackupDirFn != nil {
+		return a.patchBackupDirFn()
+	}
+	return modPatchBackupRoot()
+}
+
+func (a *clientApp) refreshModPatches() {
+	specs := modPatchSpecs()
+	if a.modPatchSpecsFn != nil {
+		specs = a.modPatchSpecsFn()
+	}
+	roots := a.steamLibraryRoots()
+	backupRoot := a.patchBackupRootDir()
+	out := make([]modPatchStatus, 0, len(specs))
+	for _, spec := range specs {
+		out = append(out, inspectModPatch(spec, roots, backupRoot))
+	}
+	a.modPatches = out
+}
+
+func (a *clientApp) findModPatchStatus(workshopID string) (modPatchStatus, bool) {
+	for _, st := range a.modPatches {
+		if st.Spec.WorkshopID == workshopID {
+			return st, true
+		}
+	}
+	return modPatchStatus{}, false
+}
+
+func (a *clientApp) applyModPatchFromUI(w *gui.Window, workshopID string, force bool) {
+	st, ok := a.findModPatchStatus(workshopID)
+	if !ok {
+		return
+	}
+	updated, err := applyModPatch(st.Spec, a.steamLibraryRoots(), a.patchBackupRootDir(), force)
+	a.refreshModPatches()
+	if err != nil {
+		if a.s != nil {
+			a.s.logError("应用 Mod 补丁失败 (%s): %v", workshopID, err)
+		}
+		a.toast(w, gui.ToastError, "打补丁失败", err.Error())
+		if w != nil {
+			w.InvalidateLayout()
+		}
+		return
+	}
+	if a.s != nil {
+		a.s.logOK("已应用 Mod 补丁: %s (%s)", updated.Spec.Name, workshopID)
+	}
+	a.modPatchNotice = "已应用补丁: " + updated.Spec.Name + "（已自动备份原文件）"
+	if w != nil {
+		w.InvalidateLayout()
+	}
+}
+
+func (a *clientApp) applyAllReadyModPatchesFromUI(w *gui.Window) {
+	applied := 0
+	var firstErr error
+	for _, st := range a.modPatches {
+		if st.State != modPatchReady {
+			continue
+		}
+		if _, err := applyModPatch(st.Spec, a.steamLibraryRoots(), a.patchBackupRootDir(), false); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		applied++
+	}
+	a.refreshModPatches()
+	if firstErr != nil {
+		a.modPatchNotice = "批量打补丁存在失败项: " + firstErr.Error()
+		a.toast(w, gui.ToastError, "部分补丁失败", firstErr.Error())
+	} else if applied > 0 {
+		if a.s != nil {
+			a.s.logOK("已批量应用 %d 个 MD5 匹配的 Mod 补丁", applied)
+		}
+		a.modPatchNotice = fmt.Sprintf("批量打补丁完成：已为 %d 个 Mod 应用联机补丁", applied)
+	}
+	if w != nil {
+		w.InvalidateLayout()
+	}
+}
+
+func (a *clientApp) restoreModPatchFromUI(w *gui.Window, workshopID string) {
+	st, ok := a.findModPatchStatus(workshopID)
+	if !ok {
+		return
+	}
+	updated, err := restoreModPatch(st.Spec, a.steamLibraryRoots(), a.patchBackupRootDir())
+	a.refreshModPatches()
+	if err != nil {
+		if a.s != nil {
+			a.s.logError("还原 Mod 失败 (%s): %v", workshopID, err)
+		}
+		a.toast(w, gui.ToastError, "还原失败", err.Error())
+		if w != nil {
+			w.InvalidateLayout()
+		}
+		return
+	}
+	if a.s != nil {
+		a.s.logInfo("已还原 Mod 原版文件: %s (%s)", updated.Spec.Name, workshopID)
+	}
+	a.modPatchNotice = "已还原原版文件: " + updated.Spec.Name
+	if w != nil {
+		w.InvalidateLayout()
+	}
 }
 
 func (a *clientApp) openSyncFixDialog(w *gui.Window) {
@@ -765,6 +905,8 @@ func (a *clientApp) view(w *gui.Window) gui.View {
 		pageView = a.netTestView(w)
 	case pageDiagLog:
 		pageView = a.diagLogView(w)
+	case pageModPatch:
+		pageView = a.modPatchView(w)
 	default:
 		pageView = a.lobbyView(w)
 	}
@@ -884,6 +1026,9 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 						}
 					})
 				}
+				if page == pageModPatch {
+					app.refreshModPatches()
+				}
 				ctx.Window.InvalidateLayout()
 			},
 			Content: rowItems,
@@ -906,6 +1051,8 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 		diagBadge = "异常"
 		diagVariant = gui.BadgeError
 	}
+
+	modPatchBadge, modPatchVariant := modPatchNavBadge(a.modPatches)
 
 	lobbyBadge := ""
 	lobbyVariant := gui.BadgeSuccess
@@ -1070,6 +1217,7 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 					navBtn("nav-lobby", pageLobby, "联机大厅", lobbyBadge, lobbyVariant),
 					navBtn("nav-nettest", pageNetTest, "网络测试", netTestBadge, netTestVariant),
 					navBtn("nav-diaglog", pageDiagLog, "诊断与日志", diagBadge, diagVariant),
+					navBtn("nav-modpatch", pageModPatch, "Mod 补丁", modPatchBadge, modPatchVariant),
 				},
 			}),
 			// Spacer
@@ -1180,6 +1328,17 @@ func (a *clientApp) footerBarView(w *gui.Window) gui.View {
 		if snap.PCAPDropped != 0 {
 			rightInfo += fmt.Sprintf(" (丢 %d)", snap.PCAPDropped)
 		}
+	}
+	if snap.LogHost.Enabled {
+		if rightInfo != "" {
+			rightInfo += " · "
+		}
+		rightInfo += fmt.Sprintf("日志 %s", logsync.FormatByteSize(snap.LogHost.TotalBytes))
+	} else if snap.LogGuest.Active {
+		if rightInfo != "" {
+			rightInfo += " · "
+		}
+		rightInfo += fmt.Sprintf("上传日志 %s", logsync.FormatByteSize(snap.LogGuest.BytesSent))
 	}
 
 	metric := func(label, val string) gui.View {

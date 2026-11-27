@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"civ6relay/internal/logsync"
 	"civ6relay/internal/pcap"
 	"civ6relay/internal/protocol"
 	"civ6relay/internal/tunnel"
@@ -64,11 +65,16 @@ type sessionSnapshot struct {
 	Capture          bool
 	HostPCAP         bool
 	HostP2P          bool
+	HostLogSync      bool
 	PCAPActive       bool
 	PCAPPath         string
 	PCAPPackets      uint64
 	PCAPDropped      uint64
 	PCAPError        string
+	LogHost          logsync.HostStatus
+	LogGuest         logsync.GuestStatus
+	LogSyncDir       string
+	LogSyncError     string
 	Members          []memberView
 	CivRunning       bool
 }
@@ -78,18 +84,23 @@ type session struct {
 	capture        bool
 	hostPCAP       bool
 	hostP2P        bool
+	hostLogSync    bool
 	maxMembers     int
 	p2pAutoApplied *tunnel.Client
 	activeRecorder atomic.Pointer[pcap.Recorder]
 
-	client   *tunnel.Client
-	bridge   *win.Bridge
-	recorder *pcap.Recorder
-	subnet   *net.IPNet
-	state    connectionState
-	detail   string
-	cancel   context.CancelFunc
-	changed  func()
+	client       *tunnel.Client
+	bridge       *win.Bridge
+	recorder     *pcap.Recorder
+	logHost      *logsync.HostController
+	logGuest     *logsync.GuestController
+	subnet       *net.IPNet
+	state        connectionState
+	detail       string
+	hostName     string
+	relayDisplay string
+	cancel       context.CancelFunc
+	changed      func()
 
 	logSeq  int64
 	logs    []logEntry
@@ -100,6 +111,12 @@ type session struct {
 	pcapPackets uint64
 	pcapDropped uint64
 	pcapError   string
+
+	logSyncDir       string
+	logSyncError     string
+	lastLogHostStats logsync.HostStatus
+	logWatcherCfgFn  func() logsync.WatcherConfig
+	logBaseDirFn     func() string
 
 	quitting         bool
 	civRunning       bool
@@ -113,11 +130,12 @@ type session struct {
 	peerPathsKnown   [protocol.LastMemberID + 1]bool
 }
 
-func newSession(capture, hostPCAP, hostP2P bool, maxMembers int) *session {
+func newSession(capture, hostPCAP, hostP2P, hostLogSync bool, maxMembers int) *session {
 	s := &session{
 		capture:          capture,
 		hostPCAP:         hostPCAP,
 		hostP2P:          hostP2P,
+		hostLogSync:      hostLogSync,
 		maxMembers:       maxMembers,
 		stop:             make(chan struct{}),
 		p2pFirewallReady: make(chan struct{}),
@@ -159,6 +177,7 @@ func (s *session) captureRetentionLoop() {
 func (s *session) pruneCaptures() {
 	s.mu.Lock()
 	recorder := s.recorder
+	logHost := s.logHost
 	s.mu.Unlock()
 	activePath := ""
 	if recorder != nil {
@@ -166,6 +185,13 @@ func (s *session) pruneCaptures() {
 	}
 	if err := pcap.PruneExpired(captureDirectory(), time.Now(), activePath); err != nil {
 		s.logWarn("清理过期 PCAP 文件失败: %v", err)
+	}
+	activeLogDir := ""
+	if logHost != nil {
+		activeLogDir = logHost.SessionDir()
+	}
+	if err := logsync.PruneOldSessions(s.logBaseDir(), time.Now(), logsync.DefaultRetention, logsync.DefaultMaxSessions, activeLogDir); err != nil {
+		s.logWarn("清理过期收集日志失败: %v", err)
 	}
 }
 
@@ -333,12 +359,20 @@ func (s *session) Connect(join bool, relayText, nameText, codeText, maxMembersTe
 	s.detail = ""
 	s.pcapPath, s.pcapError = "", ""
 	s.pcapPackets, s.pcapDropped = 0, 0
+	s.logSyncDir, s.logSyncError = "", ""
+	s.lastLogHostStats = logsync.HostStatus{}
 	hostPCAP := s.hostPCAP
 	hostP2P := s.hostP2P
+	hostLogSync := s.hostLogSync
 	s.work.Add(1)
 	s.mu.Unlock()
 	stored := loadConfig()
-	cfg := Config{RelayHost: host, RelayPort: port, DisplayName: name, RelayHistory: stored.RelayHistory, HostPCAP: hostPCAP, HostP2P: hostP2P, MaxMembers: maxMembers}
+	cfg := Config{
+		RelayHost: host, RelayPort: port, DisplayName: name,
+		RelayHistory: stored.RelayHistory,
+		HostPCAP:     hostPCAP, HostP2P: hostP2P, HostLogSync: hostLogSync,
+		MaxMembers: maxMembers,
+	}
 	go s.connectWorker(ctx, cancel, cfg, code)
 	s.notify()
 	return nil
@@ -378,14 +412,18 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	}
 	var bridge *win.Bridge
 	var recorder *pcap.Recorder
+	var logHost *logsync.HostController
+	var logGuest *logsync.GuestController
 	transferred := false
 	defer func() {
 		if !transferred {
 			s.activeRecorder.Store(nil)
+			stopLogSync(logHost, logGuest)
 			s.finishCapture(recorder, stopConnection(client, bridge, recorder))
 		}
 	}()
 	client.SetEventHandler(func(ev tunnel.Event) { s.onTunnelEvent(client, ev) })
+	client.SetAuxHandler(func(src uint8, payload []byte) { s.onAuxData(client, src, payload) })
 	var welcome *protocol.WelcomeMessage
 	if code == "" {
 		welcome, err = client.CreateRoomContextMaxMembers(handshakeCtx, cfg.DisplayName, cfg.MaxMembers)
@@ -396,8 +434,9 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	if err != nil {
 		return err
 	}
+	relayDisplay := win.FormatRelay(cfg.RelayHost, cfg.RelayPort)
 	if code == "" {
-		cfg.RelayHistory = addRelayHistory(cfg.RelayHistory, win.FormatRelay(cfg.RelayHost, cfg.RelayPort))
+		cfg.RelayHistory = addRelayHistory(cfg.RelayHistory, relayDisplay)
 		if err := saveConfig(cfg); err != nil {
 			s.logWarn("保存建房中转地址历史失败: %v", err)
 		}
@@ -469,6 +508,24 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		}
 		s.logOK("已入房 %s (#%d, 网段 %s, 出口 %s)", welcome.RoomCode, welcome.MemberID, subnet, route.LocalIP)
 	}
+
+	logSyncError := ""
+	s.mu.Lock()
+	hostLogSync := s.hostLogSync
+	s.mu.Unlock()
+	if !welcome.Host {
+		logGuest = s.newGuestLogSync(client, cfg.DisplayName)
+	} else if hostLogSync {
+		logHost, err = s.startHostLogSync(client, welcome.RoomCode, cfg.DisplayName, relayDisplay)
+		if err != nil {
+			logSyncError = err.Error()
+			s.logWarn("日志收集启动失败: %v", err)
+			logHost = nil
+		} else {
+			s.logOK("日志收集: %s", logHost.SessionDir())
+		}
+	}
+
 	s.mu.Lock()
 	if ctx.Err() != nil {
 		s.mu.Unlock()
@@ -479,9 +536,15 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		return errors.New("房间已关闭")
 	}
 	s.client, s.bridge, s.recorder, s.subnet = client, bridge, recorder, subnet
+	s.logHost, s.logGuest = logHost, logGuest
+	s.hostName, s.relayDisplay = cfg.DisplayName, relayDisplay
 	s.pcapError = captureError
 	if recorder != nil {
 		s.pcapPath = recorder.Path()
+	}
+	s.logSyncError = logSyncError
+	if logHost != nil {
+		s.logSyncDir = logHost.SessionDir()
 	}
 	s.state, s.detail, s.cancel = stateJoined, detail, nil
 	s.p2pAutoApplied = nil
@@ -691,6 +754,190 @@ func (s *session) SetHostPCAP(enabled bool) error {
 	return nil
 }
 
+func (s *session) logBaseDir() string {
+	if s.logBaseDirFn != nil {
+		return s.logBaseDirFn()
+	}
+	return collectedLogsDirectory()
+}
+
+func (s *session) logWatcherCfg() logsync.WatcherConfig {
+	if s.logWatcherCfgFn != nil {
+		return s.logWatcherCfgFn()
+	}
+	return buildLocalWatcherConfig()
+}
+
+func (s *session) newGuestLogSync(client *tunnel.Client, displayName string) *logsync.GuestController {
+	return logsync.NewGuestController(logsync.GuestConfig{
+		Send:       client.SendAuxData,
+		HostID:     client.HostMemberID,
+		Identity:   func() (string, string, string) { return localIdentity(displayName) },
+		WatcherCfg: s.logWatcherCfg(),
+		OnChange:   s.notify,
+		Logf:       s.logAt,
+	})
+}
+
+func (s *session) startHostLogSync(client *tunnel.Client, roomCode, hostName, relayDisplay string) (*logsync.HostController, error) {
+	computer, _, _ := localIdentity(hostName)
+	return logsync.StartHostController(logsync.HostConfig{
+		BaseDir:      s.logBaseDir(),
+		RoomCode:     roomCode,
+		RelayAddr:    relayDisplay,
+		HostMemberID: client.MemberID(),
+		HostName:     hostName,
+		HostComputer: computer,
+		PCAPPath: func() string {
+			if rec := s.activeRecorder.Load(); rec != nil {
+				return rec.Path()
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.pcapPath
+		},
+		Send:           client.SendAuxData,
+		Peers:          client.Peers,
+		HostWatcherCfg: s.logWatcherCfg(),
+		OnChange:       s.notify,
+		Logf:           s.logAt,
+	})
+}
+
+func (s *session) onAuxData(client *tunnel.Client, sourceMember uint8, payload []byte) {
+	s.mu.Lock()
+	if s.quitting || s.client != client {
+		s.mu.Unlock()
+		return
+	}
+	lh := s.logHost
+	lg := s.logGuest
+	s.mu.Unlock()
+	if lh != nil {
+		lh.HandleAux(sourceMember, payload)
+	}
+	if lg != nil {
+		lg.HandleAux(sourceMember, payload)
+	}
+}
+
+func (s *session) saveHostLogSyncConfig(enabled bool) {
+	s.updateConfig(func(cfg *Config) bool {
+		if cfg.HostLogSync == enabled {
+			return false
+		}
+		cfg.HostLogSync = enabled
+		return true
+	})
+}
+
+// SetHostLogSync updates the host log collection preference and starts or stops
+// live streaming log collection immediately when currently hosting a room.
+func (s *session) SetHostLogSync(enabled bool) error {
+	s.mu.Lock()
+	if s.quitting {
+		s.mu.Unlock()
+		return errors.New("程序正在退出。")
+	}
+	if s.state == stateConnecting || s.state == stateLeaving {
+		s.mu.Unlock()
+		return errors.New("当前正在切换连接状态，请稍后再试。")
+	}
+	if s.state == stateJoined && s.client != nil && !s.client.IsHost() {
+		s.mu.Unlock()
+		return errors.New("仅房主可以开关日志收集。")
+	}
+	s.hostLogSync = enabled
+	state := s.state
+	client := s.client
+	oldHost := s.logHost
+	if state != stateJoined || client == nil {
+		s.mu.Unlock()
+		s.saveHostLogSyncConfig(enabled)
+		s.notify()
+		return nil
+	}
+	if !enabled {
+		s.logHost = nil
+		if oldHost != nil {
+			st := oldHost.Status()
+			st.Enabled = false
+			s.lastLogHostStats = st
+			s.logSyncDir = oldHost.SessionDir()
+			s.work.Add(1)
+		}
+		s.mu.Unlock()
+		s.saveHostLogSyncConfig(false)
+		if oldHost != nil {
+			go func() {
+				defer s.work.Done()
+				oldHost.Stop()
+				st := oldHost.Status()
+				st.Enabled = false
+				s.mu.Lock()
+				if s.logHost == nil {
+					s.lastLogHostStats = st
+					s.logSyncDir = oldHost.SessionDir()
+				}
+				s.mu.Unlock()
+				s.logInfo("停止日志收集: %s", oldHost.SessionDir())
+				s.notify()
+			}()
+		} else {
+			s.notify()
+		}
+		return nil
+	}
+	if oldHost != nil {
+		s.mu.Unlock()
+		s.saveHostLogSyncConfig(true)
+		s.notify()
+		return nil
+	}
+	s.logSyncError = ""
+	roomCode := client.RoomCode()
+	hostName := s.hostName
+	relayDisplay := s.relayDisplay
+	s.mu.Unlock()
+
+	s.saveHostLogSyncConfig(true)
+	lh, err := s.startHostLogSync(client, roomCode, hostName, relayDisplay)
+
+	s.mu.Lock()
+	if err != nil {
+		if s.state == stateJoined && s.client == client {
+			s.logSyncError = err.Error()
+		}
+		s.mu.Unlock()
+		s.logWarn("日志收集启动失败: %v", err)
+		s.notify()
+		return err
+	}
+	if s.quitting || s.state != stateJoined || s.client != client || !s.hostLogSync || s.logHost != nil {
+		s.mu.Unlock()
+		lh.Stop()
+		s.notify()
+		return nil
+	}
+	s.logHost = lh
+	s.logSyncDir = lh.SessionDir()
+	s.logSyncError = ""
+	s.lastLogHostStats = logsync.HostStatus{}
+	s.mu.Unlock()
+	s.logOK("日志收集: %s", lh.SessionDir())
+	s.notify()
+	return nil
+}
+
+func stopLogSync(lh *logsync.HostController, lg *logsync.GuestController) {
+	if lh != nil {
+		lh.Stop()
+	}
+	if lg != nil {
+		lg.Close()
+	}
+}
+
 func (s *session) RetryP2PFirewall(status tunnel.P2PStatus) error {
 	if !status.Enabled || len(status.Endpoints) == 0 {
 		return errors.New("P2P 未就绪")
@@ -784,9 +1031,17 @@ func (s *session) Disconnect() {
 func (s *session) teardownLocked(detail string) {
 	s.activeRecorder.Store(nil)
 	client, bridge, recorder := s.client, s.bridge, s.recorder
+	logHost, logGuest := s.logHost, s.logGuest
 	s.client, s.bridge, s.recorder, s.subnet = nil, nil, nil, nil
+	s.logHost, s.logGuest = nil, nil
 	if recorder != nil {
 		s.pcapPath = recorder.Path()
+	}
+	if logHost != nil {
+		st := logHost.Status()
+		st.Enabled = false
+		s.lastLogHostStats = st
+		s.logSyncDir = logHost.SessionDir()
 	}
 	s.state, s.detail = stateLeaving, ""
 	s.peerPaths = [protocol.LastMemberID + 1]tunnel.PeerPath{}
@@ -794,6 +1049,17 @@ func (s *session) teardownLocked(detail string) {
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
+		stopLogSync(logHost, logGuest)
+		if logHost != nil {
+			st := logHost.Status()
+			st.Enabled = false
+			s.mu.Lock()
+			if s.logHost == nil {
+				s.lastLogHostStats = st
+				s.logSyncDir = logHost.SessionDir()
+			}
+			s.mu.Unlock()
+		}
 		s.finishCapture(recorder, stopConnection(client, bridge, recorder))
 		if detail != "" {
 			s.logInfo("%s", detail)
@@ -854,6 +1120,7 @@ func (s *session) onTunnelEvent(client *tunnel.Client, ev tunnel.Event) {
 		s.mu.Unlock()
 		return
 	}
+	logHost := s.logHost
 	if ev.Type == tunnel.EventRoomClosed {
 		reason := "房间已关闭"
 		switch ev.Reason {
@@ -865,6 +1132,9 @@ func (s *session) onTunnelEvent(client *tunnel.Client, ev tunnel.Event) {
 		s.teardownLocked(reason)
 	}
 	s.mu.Unlock()
+	if ev.Type == tunnel.EventPeers && logHost != nil {
+		logHost.UpdatePeers(ev.Peers)
+	}
 	if ev.Type == tunnel.EventTransportError && ev.Err != nil {
 		s.logError("网络错误: %v", ev.Err)
 	}
@@ -888,11 +1158,17 @@ func (s *session) Shutdown() {
 	}
 	s.activeRecorder.Store(nil)
 	client, bridge, recorder := s.client, s.bridge, s.recorder
+	logHost, logGuest := s.logHost, s.logGuest
 	s.client, s.bridge, s.recorder, s.subnet = nil, nil, nil, nil
+	s.logHost, s.logGuest = nil, nil
 	if recorder != nil {
 		s.pcapPath = recorder.Path()
 	}
+	if logHost != nil {
+		s.logSyncDir = logHost.SessionDir()
+	}
 	s.mu.Unlock()
+	stopLogSync(logHost, logGuest)
 	s.finishCapture(recorder, stopConnection(client, bridge, recorder))
 	s.work.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -906,15 +1182,22 @@ func (s *session) Shutdown() {
 func (s *session) Snapshot() sessionSnapshot {
 	s.mu.Lock()
 	snap := sessionSnapshot{
-		State: s.state, Detail: s.detail, Capture: s.capture, HostPCAP: s.hostPCAP, HostP2P: s.hostP2P, MaxMembers: s.maxMembers, CivRunning: s.civRunning,
+		State: s.state, Detail: s.detail, Capture: s.capture,
+		HostPCAP: s.hostPCAP, HostP2P: s.hostP2P, HostLogSync: s.hostLogSync,
+		MaxMembers: s.maxMembers, CivRunning: s.civRunning,
 		P2PFirewallError: s.p2pFirewallError,
 		PCAPActive:       s.recorder != nil,
 		PCAPPath:         s.pcapPath, PCAPPackets: s.pcapPackets, PCAPDropped: s.pcapDropped, PCAPError: s.pcapError,
+		LogHost:      s.lastLogHostStats,
+		LogSyncDir:   s.logSyncDir,
+		LogSyncError: s.logSyncError,
 	}
 	subnet := s.subnet
 	client := s.client
 	bridge := s.bridge
 	recorder := s.recorder
+	logHost := s.logHost
+	logGuest := s.logGuest
 	s.mu.Unlock()
 
 	if subnet != nil {
@@ -930,6 +1213,16 @@ func (s *session) Snapshot() sessionSnapshot {
 		if err := recorder.Error(); err != nil {
 			snap.PCAPError = err.Error()
 		}
+	}
+	if logHost != nil {
+		snap.LogHost = logHost.Status()
+		snap.LogSyncDir = snap.LogHost.SessionDir
+		if snap.LogHost.LastError != "" {
+			snap.LogSyncError = snap.LogHost.LastError
+		}
+	}
+	if logGuest != nil {
+		snap.LogGuest = logGuest.Status()
 	}
 	if client == nil {
 		return snap

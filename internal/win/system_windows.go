@@ -516,6 +516,24 @@ func FindCiv6Processes() []Process {
 	return out
 }
 
+// FindRelevantProcesses lists running Civilization and Civ6Relay processes.
+func FindRelevantProcesses() []Process {
+	var out []Process
+	for _, p := range listProcesses() {
+		lower := strings.ToLower(p.Name)
+		if strings.Contains(lower, "civilization") || strings.Contains(lower, "civ6relay") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// RunHiddenCommand executes a console utility without flashing a terminal
+// window and returns its combined output.
+func RunHiddenCommand(timeout time.Duration, name string, args ...string) (string, error) {
+	return runHiddenOutputTimeout(timeout, name, args...)
+}
+
 // FirewallRuleExists reports whether the Civ6Relay inbound rule is present.
 func FirewallRuleExists() bool {
 	_, err := runHiddenOutput("netsh", "advfirewall", "firewall", "show", "rule", "name=Civ6Relay-Game-Inbound")

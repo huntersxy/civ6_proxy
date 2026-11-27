@@ -25,6 +25,7 @@ type Config struct {
 	RelayHistory []string `json:"relay_history,omitempty"`
 	HostPCAP     bool     `json:"host_pcap,omitempty"`
 	HostP2P      bool     `json:"host_p2p,omitempty"`
+	HostLogSync  bool     `json:"host_log_sync,omitempty"`
 	MaxMembers   int      `json:"max_members,omitempty"`
 }
 
@@ -62,6 +63,7 @@ func loadConfig() Config {
 	cfg.RelayHistory = normalizeRelayHistory(stored.RelayHistory)
 	cfg.HostPCAP = stored.HostPCAP
 	cfg.HostP2P = stored.HostP2P
+	cfg.HostLogSync = stored.HostLogSync
 	if stored.MaxMembers >= 0 && stored.MaxMembers <= protocol.MaxRoomMembers {
 		cfg.MaxMembers = stored.MaxMembers
 	}

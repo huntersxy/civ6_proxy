@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"civ6relay/internal/logsync"
 	"civ6relay/internal/playtest"
 	"civ6relay/internal/relay"
 	"civ6relay/internal/speedtest"
@@ -32,9 +33,12 @@ func newTestClientWindow(t *testing.T, dark bool) (*gui.Window, *clientApp) {
 	}
 	app := newClientApp(nil, cfg)
 	testModsRoot := filepath.Join(t.TempDir(), "Mods")
+	testBackupRoot := filepath.Join(t.TempDir(), "modpatch_backups")
 	app.modsRootFn = func() (string, error) { return testModsRoot, nil }
 	app.workshopRootsFn = func() []string { return nil }
+	app.patchBackupDirFn = func() string { return testBackupRoot }
 	app.refreshSyncFixStatus()
+	app.refreshModPatches()
 	app.logEntries = []logEntry{
 		{Time: "22:00:01", Level: "INFO", Message: "Civ6RelayClient 启动"},
 		{Time: "22:00:02", Level: "OK", Message: "已进入房间 ABCD123456"},
@@ -137,6 +141,22 @@ func TestClientUINavigationAndThemes(t *testing.T) {
 			w.TestRender(nil)
 			if dups := w.TestDuplicateIDs(); len(dups) != 0 {
 				t.Fatalf("diaglog duplicate IDs: %v", dups)
+			}
+
+			// Navigate to Mod Patch page
+			modPatchNav := w.ResolveID("nav-modpatch")
+			if len(modPatchNav) != 1 {
+				t.Fatalf("expected 1 nav-modpatch ID, got %v", modPatchNav)
+			}
+			if err := w.TestClick(modPatchNav[0]); err != nil {
+				t.Fatalf("click nav-modpatch: %v", err)
+			}
+			if app.page != pageModPatch {
+				t.Fatalf("expected pageModPatch, got %v", app.page)
+			}
+			w.TestRender(nil)
+			if dups := w.TestDuplicateIDs(); len(dups) != 0 {
+				t.Fatalf("modpatch duplicate IDs: %v", dups)
 			}
 
 			// Navigate back to Lobby
@@ -275,6 +295,205 @@ func TestSessionSetHostPCAPPersistsAndDefaultsOff(t *testing.T) {
 	if s.Snapshot().HostPCAP || loadConfig().HostPCAP {
 		t.Fatal("expected HostPCAP to persist as false")
 	}
+}
+
+func TestHostLogSyncSwitchDefaultsOffAndToggles(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	if app.hostLogSync {
+		t.Fatal("expected hostLogSync to default to false")
+	}
+
+	switches := w.ResolveID("host-logsync-switch")
+	if len(switches) != 1 {
+		t.Fatalf("expected 1 host-logsync-switch, got %v", switches)
+	}
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click host-logsync-switch on: %v", err)
+	}
+	w.TestRender(nil)
+	if !app.hostLogSync {
+		t.Fatal("expected hostLogSync to toggle to true")
+	}
+
+	switches = w.ResolveID("host-logsync-switch")
+	if err := w.TestClick(switches[0]); err != nil {
+		t.Fatalf("click host-logsync-switch off: %v", err)
+	}
+	w.TestRender(nil)
+	if app.hostLogSync {
+		t.Fatal("expected hostLogSync to toggle back to false")
+	}
+
+	// While joined as a non-host member, clicking the disabled switch must not toggle.
+	app.snap = sessionSnapshot{
+		State:    stateJoined,
+		RoomCode: "K7M2P9Q4X8",
+		MemberID: 3,
+		Host:     false,
+		LogGuest: logsync.GuestStatus{Active: true, FilesSynced: 4, BytesSent: 12345},
+	}
+	app.activeCode = "K7M2P9Q4X8"
+	w.TestRender(nil)
+	if dups := w.TestDuplicateIDs(); len(dups) != 0 {
+		t.Fatalf("guest logsync lobby duplicate IDs: %v", dups)
+	}
+	switches = w.ResolveID("host-logsync-switch")
+	_ = w.TestClick(switches[0])
+	if app.hostLogSync {
+		t.Fatal("expected disabled host-logsync-switch not to toggle when non-host")
+	}
+
+	// Opening collected logs directory from lobby and diaglog pages.
+	var opened []string
+	app.openPathFn = func(p string) error {
+		opened = append(opened, p)
+		return nil
+	}
+	sessionDir := t.TempDir()
+	app.snap.LogSyncDir = sessionDir
+	w.TestRender(nil)
+	dirBtns := w.ResolveID("host-logsync-dir")
+	if len(dirBtns) != 1 {
+		t.Fatalf("expected 1 host-logsync-dir button, got %v", dirBtns)
+	}
+	if err := w.TestClick(dirBtns[0]); err != nil {
+		t.Fatalf("click host-logsync-dir: %v", err)
+	}
+	diagNav := w.ResolveID("nav-diaglog")
+	if err := w.TestClick(diagNav[0]); err != nil {
+		t.Fatalf("click nav-diaglog: %v", err)
+	}
+	collectedBtns := w.ResolveID("log-collected-dir")
+	if len(collectedBtns) != 1 {
+		t.Fatalf("expected 1 log-collected-dir button, got %v", collectedBtns)
+	}
+	if err := w.TestClick(collectedBtns[0]); err != nil {
+		t.Fatalf("click log-collected-dir: %v", err)
+	}
+	if len(opened) != 2 || opened[0] != sessionDir || opened[1] != collectedLogsDirectory() {
+		t.Fatalf("unexpected opened log dirs: %v (want %s, %s)", opened, sessionDir, collectedLogsDirectory())
+	}
+}
+
+func TestSessionHostLogSyncToggleAndLiveCollection(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	srv := relay.New(relay.Config{Logger: log.New(io.Discard, "", 0)})
+	go func() {
+		buf := make([]byte, 4096)
+		var batch relay.Batch
+		for {
+			n, peer, err := conn.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			srv.HandleInto(buf[:n], peer, &batch)
+			for _, out := range batch.Datagrams {
+				_, _ = conn.WriteToUDPAddrPort(out.Data, out.Addr)
+			}
+		}
+	}()
+	addr := conn.LocalAddr().(*net.UDPAddr)
+
+	hostLogSrc := filepath.Join(t.TempDir(), "Civ6SyncFix.log")
+	guestLogSrc := filepath.Join(t.TempDir(), "Civ6SyncFix.log")
+	if err := os.WriteFile(hostLogSrc, []byte("host-init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(guestLogSrc, []byte("guest-init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	collectRoot := filepath.Join(t.TempDir(), "collected_logs")
+
+	hostSess := &session{
+		capture:          false,
+		stop:             make(chan struct{}),
+		p2pFirewallReady: make(chan struct{}),
+		logBaseDirFn:     func() string { return collectRoot },
+		logWatcherCfgFn: func() logsync.WatcherConfig {
+			return logsync.WatcherConfig{
+				DiscoverInterval: 50 * time.Millisecond,
+				DiscoverFiles: func() []logsync.SourceSpec {
+					return []logsync.SourceSpec{{RelPath: "civ6_logs/Civ6SyncFix.log", FullPath: hostLogSrc}}
+				},
+				GenerateEnv: func() []byte { return []byte("Computer: HOST-TEST\r\n") },
+			}
+		},
+	}
+	guestSess := &session{
+		capture:          false,
+		stop:             make(chan struct{}),
+		p2pFirewallReady: make(chan struct{}),
+		logWatcherCfgFn: func() logsync.WatcherConfig {
+			return logsync.WatcherConfig{
+				DiscoverInterval: 50 * time.Millisecond,
+				DiscoverFiles: func() []logsync.SourceSpec {
+					return []logsync.SourceSpec{{RelPath: "civ6_logs/Civ6SyncFix.log", FullPath: guestLogSrc}}
+				},
+				GenerateEnv: func() []byte { return []byte("Computer: GUEST-TEST\r\n") },
+			}
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := hostSess.openRoom(ctx, Config{RelayHost: "127.0.0.1", RelayPort: addr.Port, DisplayName: "房主"}, ""); err != nil {
+		t.Fatalf("host openRoom: %v", err)
+	}
+	defer hostSess.Shutdown()
+	roomCode := hostSess.Snapshot().RoomCode
+	if hostSess.Snapshot().HostLogSync || hostSess.Snapshot().LogHost.Enabled {
+		t.Fatal("expected HostLogSync to default off on create")
+	}
+
+	if err := guestSess.openRoom(ctx, Config{RelayHost: "127.0.0.1", RelayPort: addr.Port, DisplayName: "队友"}, roomCode); err != nil {
+		t.Fatalf("guest openRoom: %v", err)
+	}
+	defer guestSess.Shutdown()
+
+	if err := guestSess.SetHostLogSync(true); err == nil {
+		t.Fatal("expected non-host SetHostLogSync to fail")
+	}
+
+	// Host enables log sync live mid-room!
+	if err := hostSess.SetHostLogSync(true); err != nil {
+		t.Fatalf("host SetHostLogSync(true): %v", err)
+	}
+	if !loadConfig().HostLogSync {
+		t.Fatal("expected HostLogSync=true to persist in config")
+	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	var sessionDir string
+	for time.Now().Before(deadline) {
+		hSnap := hostSess.Snapshot()
+		gSnap := guestSess.Snapshot()
+		if hSnap.LogHost.Enabled && hSnap.LogHost.ActivePeers == 1 && hSnap.LogHost.HostFiles >= 2 && hSnap.LogHost.GuestBytes > 0 && gSnap.LogGuest.Active {
+			sessionDir = hSnap.LogSyncDir
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sessionDir == "" {
+		t.Fatalf("timed out waiting for live host+guest log sync; host=%+v guest=%+v", hostSess.Snapshot().LogHost, guestSess.Snapshot().LogGuest)
+	}
+
+	// Turn off mid-room and verify guest stops cleanly.
+	if err := hostSess.SetHostLogSync(false); err != nil {
+		t.Fatalf("host SetHostLogSync(false): %v", err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if !hostSess.Snapshot().LogHost.Enabled && !guestSess.Snapshot().LogGuest.Active {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	t.Fatalf("expected guest to stop after host SetHostLogSync(false), guest=%+v", guestSess.Snapshot().LogGuest)
 }
 
 func TestHostP2PSwitchPreRoomTogglesAndPersists(t *testing.T) {

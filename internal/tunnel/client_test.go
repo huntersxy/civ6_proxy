@@ -164,6 +164,39 @@ func TestTunnelEndToEnd(t *testing.T) {
 		t.Fatal("host did not receive fragmented data")
 	}
 
+	// Sideband aux data must reach AuxHandler without touching DataHandler or game counters.
+	hostAux := make(chan []byte, 4)
+	host.SetAuxHandler(func(src uint8, payload []byte) {
+		if src == guest.MemberID() {
+			hostAux <- payload
+		}
+	})
+	beforeHostRx := host.Metrics().GameRxDatagrams
+	beforeGuestTx := guest.Metrics().GameTxDatagrams
+	auxPayload := bytes.Repeat([]byte("C6LG-aux-log-line\n"), 200)
+	if !guest.SendAuxData(host.MemberID(), auxPayload) {
+		t.Fatal("SendAuxData failed")
+	}
+	select {
+	case got := <-hostAux:
+		if !bytes.Equal(got, auxPayload) {
+			t.Fatal("aux payload mismatch")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("host did not receive aux payload")
+	}
+	select {
+	case leaked := <-hostData:
+		t.Fatalf("aux payload leaked to game DataHandler (%d bytes)", len(leaked))
+	default:
+	}
+	if host.Metrics().GameRxDatagrams != beforeHostRx || guest.Metrics().GameTxDatagrams != beforeGuestTx {
+		t.Fatalf("aux send polluted game datagram counters")
+	}
+	if guest.HostMemberID() != host.MemberID() {
+		t.Fatalf("HostMemberID() = %d, want %d", guest.HostMemberID(), host.MemberID())
+	}
+
 	// Host leave -> guest gets ROOM_CLOSED.
 	host.Disconnect()
 	deadline := time.After(3 * time.Second)

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"testing"
 	"unsafe"
 )
 
@@ -70,6 +71,9 @@ var (
 )
 
 func openFolder(path string) error {
+	if testing.Testing() {
+		return nil
+	}
 	cleaned := filepath.Clean(path)
 	if info, err := os.Stat(cleaned); err == nil && info.IsDir() {
 		cmd := exec.Command("explorer.exe", cleaned)
@@ -101,6 +105,9 @@ func openFolder(path string) error {
 }
 
 func openURL(rawURL string) error {
+	if testing.Testing() {
+		return nil
+	}
 	trimmed := strings.TrimSpace(rawURL)
 	if !strings.HasPrefix(trimmed, "https://") && !strings.HasPrefix(trimmed, "http://") {
 		return fmt.Errorf("不支持的链接协议: %s", rawURL)
