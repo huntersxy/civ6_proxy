@@ -86,11 +86,12 @@ bool TestExeFile(const char* path) {
         printf("[FAIL] ScanTextSection failed (%d/%d)\n", rt.matchedCount, kPatternCount);
         return false;
     }
-    printf("  Helpers: Insert24=0x%X Policy=0x%X Alloc=0x%X Rehash24=0x%X Free=0x%X\n",
+    printf("  Helpers: Insert24=0x%X Policy=0x%X Alloc=0x%X Rehash24=0x%X Rehash48=0x%X Free=0x%X\n",
            static_cast<unsigned>(textVa + rt.insert24Off),
            static_cast<unsigned>(textVa + rt.rehashPolicyOff),
            static_cast<unsigned>(textVa + rt.gameAllocOff),
            static_cast<unsigned>(textVa + rt.rehash24Off),
+           static_cast<unsigned>(textVa + rt.rehash48Off),
            static_cast<unsigned>(textVa + rt.gameFreeOff));
 
     // Verify exact expected prefix bytes before flipping!
@@ -112,8 +113,12 @@ bool TestExeFile(const char* path) {
     ok &= checkByte(20, 0, 0x44) && checkByte(20, 10, 0x41) && checkByte(20, 13, 0x41);
     ok &= checkByte(24, 0, 0x40) && checkByte(24, 1, 0x53) && checkByte(24, 2, 0x48);
     ok &= checkByte(25, 0, 0x41) && checkByte(25, 5, 0x0F) && checkByte(25, 6, 0x85);
-    ok &= checkByte(26, 0, 0x45) && checkByte(26, 3, 0x48) && checkByte(26, 6, 0xF0);
+    ok &= checkByte(26, 0, 0x48) && checkByte(26, 3, 0xF0) && checkByte(26, 4, 0x48) &&
+          checkByte(26, 7, 0xF8) && checkByte(26, 8, 0x74);
     ok &= checkByte(27, 0, 0x48) && checkByte(27, 5, 0x57) && checkByte(27, 6, 0x48);
+    ok &= checkByte(28, 0, 0xE8);
+    ok &= checkByte(29, 0, 0x45) && checkByte(29, 12, 0x41) && checkByte(29, 18, 0x41);
+    ok &= checkByte(30, 0, 0x33) && checkByte(30, 2, 0x41) && checkByte(30, 18, 0xE8);
     printf("  Pre-patch opcode byte check: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -224,6 +229,124 @@ bool TestHashMap64Unit() {
         return false;
     }
     printf("  Unit test: PASS (0 leaks, 100%% key preservation, max_chain=%u)\n", maxChain);
+    return true;
+}
+
+struct Node48 {
+    uint64_t key;
+    uint32_t hashValue;
+    uint32_t pad0;
+    uint8_t  payload[24];
+    Node48*  next;  // +0x28 (exact ArchiveSyncInfo node layout)
+};
+static_assert(offsetof(Node48, next) == 0x28, "Node48::next must be at +0x28");
+
+bool TestCopySyncMap48Unit() {
+    printf("\n=== Unit Testing NetGameSyncCheck CopySyncMap 48B Node Rehash (Turn-25 scenario) ===\n");
+    SetEngineHelpersForTest(&MockRehashPolicy, &MockAlloc, &MockFree);
+
+    void* staticDummy[2] = {nullptr, reinterpret_cast<void*>(~static_cast<uintptr_t>(0))};
+    THashMapHeader map{};
+    map.buckets = staticDummy;
+    map.bucketCount = 1;
+    map.elemCount = 0;
+
+    // Reproduce Turn 25: 2,844 archives (600 with hi32==0, 2,244 with hi32!=0).
+    constexpr uint32_t kTotal = 2844;
+    std::vector<uint64_t> keys;
+    keys.reserve(kTotal);
+    for (uint32_t i = 1; i <= 600; ++i) {
+        keys.push_back(static_cast<uint64_t>(i) | (0x0012ULL << 16));
+    }
+    for (uint32_t i = 1; i <= 2244; ++i) {
+        keys.push_back((static_cast<uint64_t>(i) << 32) | 0x0045FFFFULL);
+    }
+
+    // 1) Simulate CopySyncMap_Rehash (pre-sizing empty/small map via Rehash48_64 before copy loop).
+    RehashDecision preDec{};
+    MockRehashPolicy(nullptr, &preDec, map.bucketCount, map.elemCount, 128);
+    if (preDec.needRehash) {
+        RehashMap64(&map, preDec.newBucketCount, offsetof(Node48, next));
+    }
+
+    // 2) Simulate CopySyncMap_Insert loop (64-bit lookup + 64-bit rehash on growth via Rehash48_64).
+    for (uint32_t i = 0; i < kTotal; ++i) {
+        uint64_t key = keys[i];
+        uint64_t b = key % map.bucketCount;
+        bool dup = false;
+        for (Node48* cur = reinterpret_cast<Node48*>(map.buckets[b]); cur; cur = cur->next) {
+            if (cur->key == key) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            printf("  [FAIL] Unexpected duplicate key at i=%u\n", i);
+            return false;
+        }
+        RehashDecision dec{};
+        MockRehashPolicy(nullptr, &dec, map.bucketCount, map.elemCount, 1);
+        auto* node = reinterpret_cast<Node48*>(MockAlloc(sizeof(Node48), 0, 0, 0, 0, 0));
+        std::memset(node, 0, sizeof(Node48));
+        node->key = key;
+        node->hashValue = i + 1;
+        if (dec.needRehash) {
+            b = key % dec.newBucketCount;
+            RehashMap64(&map, dec.newBucketCount, offsetof(Node48, next));
+        }
+        node->next = reinterpret_cast<Node48*>(map.buckets[b]);
+        map.buckets[b] = node;
+        map.elemCount += 1;
+    }
+
+    // 3) Simulate ProcessRecv_Loop2 64-bit lookup for ALL 2,844 keys (must have 0 not_on_client!).
+    if (map.buckets[map.bucketCount] != reinterpret_cast<void*>(~static_cast<uintptr_t>(0))) {
+        printf("  [FAIL] Node48 map sentinel corrupted!\n");
+        return false;
+    }
+    uint32_t maxChain = 0;
+    for (uint32_t b = 0; b < map.bucketCount; ++b) {
+        uint32_t len = 0;
+        for (Node48* n = reinterpret_cast<Node48*>(map.buckets[b]); n; n = n->next) {
+            ++len;
+            if ((n->key % map.bucketCount) != b) {
+                printf("  [FAIL] Misplaced Node48 key=0x%llX in bucket %u\n",
+                       static_cast<unsigned long long>(n->key), b);
+                return false;
+            }
+        }
+        if (len > maxChain) maxChain = len;
+    }
+    for (uint32_t i = 0; i < kTotal; ++i) {
+        uint64_t b = keys[i] % map.bucketCount;
+        bool found = false;
+        for (Node48* n = reinterpret_cast<Node48*>(map.buckets[b]); n; n = n->next) {
+            if (n->key == keys[i] && n->hashValue == i + 1) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            printf("  [FAIL] ProcessRecv_Loop2 missed key=0x%llX after CopySyncMap!\n",
+                   static_cast<unsigned long long>(keys[i]));
+            return false;
+        }
+    }
+
+    for (uint32_t b = 0; b < map.bucketCount; ++b) {
+        Node48* n = reinterpret_cast<Node48*>(map.buckets[b]);
+        while (n) {
+            Node48* next = n->next;
+            MockFree(nullptr, n, sizeof(Node48));
+            n = next;
+        }
+    }
+    MockFree(nullptr, map.buckets, (map.bucketCount + 1) * sizeof(void*));
+    if (g_liveAllocs != 0) {
+        printf("  [FAIL] Memory leak in CopySyncMap48 test: liveAllocs=%zu\n", g_liveAllocs);
+        return false;
+    }
+    printf("  CopySyncMap48 unit test: PASS (2844/2844 found, 0 misplaced, max_chain=%u, 0 leaks)\n", maxChain);
     return true;
 }
 
@@ -456,6 +579,7 @@ int main() {
     ok &= TestExeFile("D:\\Steam\\steamapps\\common\\Sid Meier's Civilization VI\\Base\\Binaries\\Win64Steam\\CivilizationVI_DX12.exe");
     ok &= TestGameCoreFile("D:\\Steam\\steamapps\\common\\Sid Meier's Civilization VI\\DLC\\Expansion2\\Binaries\\Win64\\GameCore_XP2_FinalRelease.dll");
     ok &= TestHashMap64Unit();
+    ok &= TestCopySyncMap48Unit();
     ok &= TestPostReloadGuardUnit();
     ok &= TestDesyncTelemetryUnit();
     ok &= TestNationalWonderUnit();

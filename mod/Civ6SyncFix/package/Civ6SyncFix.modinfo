@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Mod id="7f3c8e21-4a9b-4d1e-9c52-8e1a6b4f2091" version="4">
+<Mod id="7f3c8e21-4a9b-4d1e-9c52-8e1a6b4f2091" version="6">
   <Properties>
     <Name>LOC_CIV6SYNCFIX_MOD_NAME</Name>
     <Description>LOC_CIV6SYNCFIX_MOD_DESCRIPTION</Description>
@@ -16,17 +16,14 @@
     </UpdateDatabase>
   </FrontEndActions>
   <InGameActions>
-    <UpdateDatabase id="Civ6SyncFix_InGame">
-      <Properties>
-        <LoadOrder>1</LoadOrder>
-      </Properties>
-      <File>Config/Civ6SyncFix_Config.sql</File>
-    </UpdateDatabase>
+    <ImportFiles id="Civ6SyncFix_ImportDll">
+      <File>Binaries/Win64/c6se/Civ6SyncFix.dll</File>
+    </ImportFiles>
   </InGameActions>
   <LocalizedText>
     <Text id="LOC_CIV6SYNCFIX_MOD_NAME">
-      <en_US>Civ6SyncFix v1.3 - 64-bit Sync, Core Bugfixes &amp; Desync Diagnostics (DX11/DX12)</en_US>
-      <zh_Hans_CN>Civ6SyncFix v1.3 - 联机64位同步、内核修复与不同步诊断（DX11/DX12）</zh_Hans_CN>
+      <en_US>Civ6SyncFix v1.5 - 64-bit Sync, Core Bugfixes &amp; Desync Diagnostics (DX11/DX12)</en_US>
+      <zh_Hans_CN>Civ6SyncFix v1.5 - 联机64位同步、内核修复与不同步诊断（DX11/DX12）</zh_Hans_CN>
     </Text>
     <Text id="LOC_CIV6SYNCFIX_MOD_TEASER">
       <en_US>True 64-bit sync hash, post-reload fix, AI Great Work lag fix, National Wonder protection, Religion AI desync fix, and universal field-level desync logging (DX11/DX12).</en_US>

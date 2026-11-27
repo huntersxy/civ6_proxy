@@ -59,7 +59,7 @@ bool InstallGameCoreFixesIfNeeded();
 // Log a formatted line to %LOCALAPPDATA%\Firaxis Games\Sid Meier's Civilization VI\Logs\Civ6SyncFix.log.
 void LogInfo(const char* fmt, ...);
 
-constexpr int kPatternCount = 28;
+constexpr int kPatternCount = 31;
 constexpr int kGameCorePatternCount = 5;
 
 // Exposed for offline verification / unit testing only.
@@ -76,6 +76,7 @@ struct ResolvedTargets {
     intptr_t rehashPolicyOff = -1;
     intptr_t gameAllocOff = -1;
     intptr_t rehash24Off = -1;
+    intptr_t rehash48Off = -1;
     intptr_t gameFreeOff = -1;
 };
 

@@ -43,7 +43,7 @@ const char* PluginGetName(C6SEPluginObj*) {
 }
 
 const char* PluginGetVersion(C6SEPluginObj*) {
-    return "1.3";
+    return "1.5";
 }
 
 const C6SEPluginVTable kPluginVTable = {

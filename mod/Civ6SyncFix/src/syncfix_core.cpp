@@ -41,6 +41,9 @@ enum PatternIdx {
     kOnLoadCompleteBarrier,
     kDeltaDesyncVars,
     kRequestFullSnapshot,
+    kCopySyncMapRehash,
+    kCopySyncMapInsertLookup,
+    kCopySyncMapInsertRehash,
 };
 
 struct PatternDef {
@@ -102,10 +105,19 @@ static const PatternDef kPatterns[kPatternCount] = {
      "40 53 48 83 EC 60 80 79 38 00 48 8B D9 74 78 8B 51 08 48 8B 0D ?? ?? ?? ?? 48 89 7C 24 70 E8 ?? ?? ?? ?? C6 43 38 00 48"},
     {"OnLoadComplete_Barrier", 0,
      "41 80 7F 08 00 0F 85 5F 02 00 00 48 8B 03 48 8B CB FF 90 F0 00 00 00 84 C0 0F 84 4B 02 00 00"},
-    {"DeltaDesyncVars", 0,
+    // Offset +3 (`mov rbx, [rbp-0x10]; cmp rbx, [rbp-8]`, 8B) avoids mid-patch jump targets
+    // at site+3 from the empty-desyncedVars logging paths (DX11 0x7F46F3/0x7F4B9B, DX12 0x7F5903/0x7F5DAB).
+    {"DeltaDesyncVars", 3,
      "45 33 FF 48 8B 5D F0 48 3B 5D F8 74 15 8B 13 48 8B 4F 08 E8 ?? ?? ?? ?? 48 83 C3 04 48 3B 5D F8 75 EB"},
     {"RequestFullSnapshot", 0,
      "48 89 5C 24 08 57 48 83 EC 60 8B 51 08 48 8B D9 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? C6 43 38 01"},
+    // Pending-queue NetGameSyncCheck::m_Archives operator= copy path (THashMap<uint64_t, ArchiveSyncInfo>, 48-byte nodes)
+    {"CopySyncMap_Rehash", 24,
+     "48 8D 54 24 60 E8 ?? ?? ?? ?? 80 7C 24 60 00 74 0C 8B 54 24 64 48 8B CE E8 ?? ?? ?? ?? 48 8B 07 48 3B 45 00 74 66"},
+    {"CopySyncMap_Insert_Lookup", 4,
+     "48 83 EC 30 45 8B 30 48 8B DA 44 8B 51 10 33 D2 41 8B C6 49 8B F0 41 F7 F2 48 8B 41 08 48 8B F9 8B EA 4C 8D 04 D0 48 8B 04 D0 48 85 C0 74 15 48 8B 0E 48 3B 08 0F 84 9B 00 00 00 48 8B 40 28"},
+    {"CopySyncMap_Insert_Rehash", 10,
+     "80 7C 24 50 00 48 8B F0 74 17 33 D2 41 8B C6 F7 74 24 54 48 8B CF 8B EA 8B 54 24 54 E8 ?? ?? ?? ?? 48 8B 47 08 8B CD 48 8D 14 CD 00 00 00 00 48 8B 0C 02 48 89 4E 28"},
 };
 
 FnRehashPolicy      g_fnRehashPolicy    = nullptr;
@@ -789,6 +801,30 @@ bool ScanTextSection(const uint8_t* textBase, size_t textSize, ResolvedTargets* 
     out->gameFreeOff = out->rehash24Off + 0xDC + 5 + ReadRel32(textBase + out->rehash24Off + 0xDD);
     if (out->gameFreeOff < 0 || static_cast<size_t>(out->gameFreeOff) >= textSize) return false;
 
+    // Verify all 4 64-bit NetGameSyncCheck Rehash48 call sites resolve to the exact same Rehash48 helper,
+    // and CopySyncMap_Rehash's preceding RehashPolicy call resolves to out->rehashPolicyOff.
+    const size_t r48_0 = out->offsets[kSendSyncRehash] + 25;
+    const size_t r48_1 = out->offsets[kDeserSyncRehash] + 17;
+    const size_t r48_2 = out->offsets[kCopySyncMapRehash];
+    const size_t r48_3 = out->offsets[kCopySyncMapInsertRehash] + 18;
+    if (r48_0 + 5 > textSize || r48_1 + 5 > textSize || r48_2 + 5 > textSize || r48_3 + 5 > textSize ||
+        r48_2 < 19 ||
+        textBase[r48_0] != 0xE8 || textBase[r48_1] != 0xE8 ||
+        textBase[r48_2] != 0xE8 || textBase[r48_3] != 0xE8 ||
+        textBase[r48_2 - 19] != 0xE8) {
+        return false;
+    }
+    const intptr_t rh0 = static_cast<intptr_t>(r48_0) + 5 + ReadRel32(textBase + r48_0 + 1);
+    const intptr_t rh1 = static_cast<intptr_t>(r48_1) + 5 + ReadRel32(textBase + r48_1 + 1);
+    const intptr_t rh2 = static_cast<intptr_t>(r48_2) + 5 + ReadRel32(textBase + r48_2 + 1);
+    const intptr_t rh3 = static_cast<intptr_t>(r48_3) + 5 + ReadRel32(textBase + r48_3 + 1);
+    const intptr_t cpPol = static_cast<intptr_t>(r48_2 - 19) + 5 + ReadRel32(textBase + r48_2 - 18);
+    if (rh0 != rh1 || rh0 != rh2 || rh0 != rh3 || cpPol != out->rehashPolicyOff ||
+        rh0 < 0 || static_cast<size_t>(rh0) >= textSize) {
+        return false;
+    }
+    out->rehash48Off = rh0;
+
     // Verify OnLoadComplete_Barrier has `cmp BYTE PTR [r15+0x8], 0; jne rel32` with valid target.
     const size_t bOff = out->offsets[kOnLoadCompleteBarrier];
     if (bOff + 11 > textSize || textBase[bOff + 5] != 0x0F || textBase[bOff + 6] != 0x85) {
@@ -1081,7 +1117,7 @@ bool InstallSyncFixOnce() {
     GetModuleFileNameA(nullptr, exePath, sizeof(exePath));
     HMODULE exeMod = GetModuleHandleW(nullptr);
     LogInfo("=======================================================");
-    LogInfo("Civ6SyncFix v1.3 (64-bit Sync + Post-Reload Fix + GameCore Fixes + Desync Telemetry)");
+    LogInfo("Civ6SyncFix v1.5 (64-bit Sync + Post-Reload Fix + GameCore Fixes + Desync Telemetry)");
     LogInfo("Process: %s | ExeBase: %p", exePath, exeMod);
 
     uint8_t* textBase = nullptr;
@@ -1109,10 +1145,11 @@ bool InstallSyncFixOnce() {
     g_fnFree         = reinterpret_cast<FnGameFree>(textBase + rt.gameFreeOff);
 
     LogInfo("All %d/%d signatures uniquely verified!", rt.matchedCount, kPatternCount);
-    LogInfo("Resolved helpers: Insert24=+0x%llX Policy=+0x%llX Alloc=+0x%llX Free=+0x%llX",
+    LogInfo("Resolved helpers: Insert24=+0x%llX Policy=+0x%llX Alloc=+0x%llX Rehash48=+0x%llX Free=+0x%llX",
             static_cast<unsigned long long>(rt.insert24Off),
             static_cast<unsigned long long>(rt.rehashPolicyOff),
             static_cast<unsigned long long>(rt.gameAllocOff),
+            static_cast<unsigned long long>(rt.rehash48Off),
             static_cast<unsigned long long>(rt.gameFreeOff));
 
     // Allocate one executable page within +/- 1.25 GB of .text midpoint so all patches stay in rel32 range.
@@ -1133,6 +1170,17 @@ bool InstallSyncFixOnce() {
         const uint8_t jmpRax[] = {0xFF, 0xE0};
         sb.emit(movRax);
         sb.emitU64(reinterpret_cast<uint64_t>(&InsertAutoArchive64));
+        sb.emit(jmpRax);
+    }
+
+    // 1b) Near jump to Rehash48_64 (for CopySyncMap_Rehash call site)
+    sb.align16();
+    const uint8_t* stubRehash48 = sb.cur();
+    {
+        const uint8_t movRax[] = {0x48, 0xB8};
+        const uint8_t jmpRax[] = {0xFF, 0xE0};
+        sb.emit(movRax);
+        sb.emitU64(reinterpret_cast<uint64_t>(&Rehash48_64));
         sb.emit(jmpRax);
     }
 
@@ -1221,6 +1269,27 @@ bool InstallSyncFixOnce() {
         sb.emitU64(reinterpret_cast<uint64_t>(&Rehash48_64));
         sb.emit(callRax);
         sb.emitRel32Branch(0xE9, textBase + rt.offsets[kDeserSyncRehash] + 22);
+    }
+
+    // 6b) CopySyncMap_Insert_Rehash (23B -> 64-bit div + call Rehash48_64)
+    sb.align16();
+    const uint8_t* stubCopyInsertRehash = sb.cur();
+    {
+        const uint8_t pre[] = {
+            0x8B, 0x4C, 0x24, 0x54,  // mov ecx, DWORD PTR [rsp+0x54]
+            0x33, 0xD2,              // xor edx, edx
+            0x4C, 0x89, 0xF0,        // mov rax, r14
+            0x48, 0xF7, 0xF1,        // div rcx
+            0x8B, 0xEA,              // mov ebp, edx
+            0x48, 0x8B, 0xCF,        // mov rcx, rdi
+            0x8B, 0x54, 0x24, 0x54,  // mov edx, DWORD PTR [rsp+0x54]
+            0x48, 0xB8               // mov rax, imm64
+        };
+        const uint8_t callRax[] = {0xFF, 0xD0};
+        sb.emit(pre);
+        sb.emitU64(reinterpret_cast<uint64_t>(&Rehash48_64));
+        sb.emit(callRax);
+        sb.emitRel32Branch(0xE9, textBase + rt.offsets[kCopySyncMapInsertRehash] + 23);
     }
 
     // 7) StartGameSyncCheck read-only timing/stats observer (11 stolen bytes)
@@ -1314,7 +1383,10 @@ bool InstallSyncFixOnce() {
         sb.emitRel32Branch(0xE9, site + 11);                             // jmp back to IsEndOfGameTurn()
     }
 
-    // 11) HandleNetSyncSnapshot universal desynced AutoVariable logger (7 stolen bytes; rsp%16==0)
+    // 11) HandleNetSyncSnapshot universal desynced AutoVariable logger
+    //     Replaces 8 bytes (`mov rbx, [rbp-0x10]; cmp rbx, [rbp-0x08]`) at site+3 so all incoming
+    //     branches (both non-empty fallthrough and empty-vars jmp) land cleanly on our jmp; rsp%16==0.
+    //     The trailing `jmp rel32` back to `je` preserves EFLAGS set by the stolen `cmp`.
     sb.align16();
     const uint8_t* stubDeltaDesyncVars = sb.cur();
     {
@@ -1334,8 +1406,8 @@ bool InstallSyncFixOnce() {
         sb.emit(saveAndArgs);
         sb.emitU64(reinterpret_cast<uint64_t>(&OnDeltaDesyncVars));
         sb.emit(rest);
-        sb.emitBytes(textBase + rt.offsets[kDeltaDesyncVars], 7);
-        sb.emitRel32Branch(0xE9, textBase + rt.offsets[kDeltaDesyncVars] + 7);
+        sb.emitBytes(textBase + rt.offsets[kDeltaDesyncVars], 8);
+        sb.emitRel32Branch(0xE9, textBase + rt.offsets[kDeltaDesyncVars] + 8);
     }
 
     // 12) RequestFullSnapshot read-only telemetry observer (10 stolen bytes; rsp%16==8 at entry)
@@ -1401,24 +1473,35 @@ bool InstallSyncFixOnce() {
         ok &= WriteByteAt(p + 13, 0x49);
     }
 
+    // CopySyncMap_Insert_Lookup: +0 (45 8B 30 -> 4D), +12 (41 8B C6 -> 49), +18 (41 F7 F2 -> 49)
+    {
+        uint8_t* p = textBase + rt.offsets[kCopySyncMapInsertLookup];
+        ok &= WriteByteAt(p + 0, 0x4D);
+        ok &= WriteByteAt(p + 12, 0x49);
+        ok &= WriteByteAt(p + 18, 0x49);
+    }
+
     // B) Redirect the 3 m_AutoArchives Insert24 call sites to InsertAutoArchive64
+    //    and the CopySyncMap_Rehash call site to Rehash48_64
     ok &= PatchCallRel32(textBase + rt.offsets[kAutoArchHelperCallIns], stubInsert24);
     ok &= PatchCallRel32(textBase + rt.offsets[kRegisterCallIns1], stubInsert24);
     ok &= PatchCallRel32(textBase + rt.offsets[kRegisterCallIns2], stubInsert24);
+    ok &= PatchCallRel32(textBase + rt.offsets[kCopySyncMapRehash], stubRehash48);
 
-    // C) Install 5 near-trampoline 64-bit lookup/rehash patches
+    // C) Install 6 near-trampoline 64-bit lookup/rehash patches
     ok &= PatchJmpRel32(textBase + rt.offsets[kProcessRecvLoop1], 14, stubProcLoop1);
     ok &= PatchJmpRel32(textBase + rt.offsets[kProcessRecvLoop2], 15, stubProcLoop2);
     ok &= PatchJmpRel32(textBase + rt.offsets[kSendSyncLookup2], 18, stubSendLookup2);
     ok &= PatchJmpRel32(textBase + rt.offsets[kSendSyncRehash], 30, stubSendRehash);
     ok &= PatchJmpRel32(textBase + rt.offsets[kDeserSyncRehash], 22, stubDeserRehash);
+    ok &= PatchJmpRel32(textBase + rt.offsets[kCopySyncMapInsertRehash], 23, stubCopyInsertRehash);
 
     // D) Install sync timing/stats observers + post-reload stale-barrier guard + desync telemetry hooks
     ok &= PatchJmpRel32(textBase + rt.offsets[kStartGameSyncCheck], 11, stubStartSync);
     ok &= PatchJmpRel32(textBase + rt.offsets[kOnSyncComplete], 10, stubSyncComplete);
     ok &= PatchJmpRel32(textBase + rt.offsets[kOnSnapshotLoaded], 6, stubOnSnapshotLoaded);
     ok &= PatchJmpRel32(textBase + rt.offsets[kOnLoadCompleteBarrier], 11, stubOnLoadCompleteBarrier);
-    ok &= PatchJmpRel32(textBase + rt.offsets[kDeltaDesyncVars], 7, stubDeltaDesyncVars);
+    ok &= PatchJmpRel32(textBase + rt.offsets[kDeltaDesyncVars], 8, stubDeltaDesyncVars);
     ok &= PatchJmpRel32(textBase + rt.offsets[kRequestFullSnapshot], 10, stubRequestFullSnapshot);
 
     if (ok) {
