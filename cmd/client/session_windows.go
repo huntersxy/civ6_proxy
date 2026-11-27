@@ -54,6 +54,7 @@ type sessionSnapshot struct {
 	RoomCode         string
 	MemberID         int
 	Host             bool
+	MaxMembers       int
 	P2P              tunnel.P2PStatus
 	P2PFirewallError string
 	Subnet           string
@@ -77,6 +78,7 @@ type session struct {
 	capture        bool
 	hostPCAP       bool
 	hostP2P        bool
+	maxMembers     int
 	p2pAutoApplied *tunnel.Client
 	activeRecorder atomic.Pointer[pcap.Recorder]
 
@@ -107,23 +109,22 @@ type session struct {
 	p2pFirewallKey   string
 	p2pFirewallBusy  bool
 	p2pFirewallError string
-	peerPaths        [10]tunnel.PeerPath
-	peerPathsKnown   [10]bool
+	peerPaths        [protocol.LastMemberID + 1]tunnel.PeerPath
+	peerPathsKnown   [protocol.LastMemberID + 1]bool
 }
 
-func newSession(capture, hostPCAP, hostP2P bool) *session {
+func newSession(capture, hostPCAP, hostP2P bool, maxMembers int) *session {
 	s := &session{
 		capture:          capture,
 		hostPCAP:         hostPCAP,
 		hostP2P:          hostP2P,
+		maxMembers:       maxMembers,
 		stop:             make(chan struct{}),
 		p2pFirewallReady: make(chan struct{}),
 	}
 	s.openLog()
 	if s.logPath == "" {
-		s.logAt("WARN", "无法创建日志文件，请检查 %LOCALAPPDATA% 权限")
-	} else {
-		s.logAt("INFO", "日志文件: "+s.logPath)
+		s.logAt("WARN", "无法创建日志文件")
 	}
 	s.work.Add(1)
 	go s.captureRetentionLoop()
@@ -226,23 +227,9 @@ func (s *session) logLocation() string {
 	return s.logPath
 }
 
-// logEnvironment writes startup facts that support needs when diagnosing.
+// logEnvironment writes a compact startup line for troubleshooting.
 func (s *session) logEnvironment() {
-	exe, _ := os.Executable()
-	s.mu.Lock()
-	hostPCAP := s.hostPCAP
-	s.mu.Unlock()
-	s.logInfo("Civ6RelayClient %s 启动", version)
-	s.logInfo("系统: %s, 管理员: %v, 抓包: %v, 房主抓包: %v", win.OSVersion(), win.IsAdmin(), s.capture, hostPCAP)
-	s.logInfo("程序: %s", exe)
-	s.logInfo("配置: %s", configPath())
-	s.logInfo("日志: %s", s.logLocation())
-	if av := win.SecuritySoftware(); len(av) > 0 {
-		s.logWarn("检测到安全软件: %s", strings.Join(av, "、"))
-	}
-	svc := win.QueryWinDivertService()
-	s.logInfo("WinDivert 服务: %s", svc.Summary())
-	s.logInfo("驱动目录: %s", win.DriverDir())
+	s.logInfo("启动 %s (%s, 管理员=%v)", version, win.OSVersion(), win.IsAdmin())
 }
 
 func (s *session) logAt(level, message string) {
@@ -309,7 +296,7 @@ func (s *session) notify() {
 }
 
 // Connect validates the inputs and starts an asynchronous connection.
-func (s *session) Connect(join bool, relayText, nameText, codeText string) error {
+func (s *session) Connect(join bool, relayText, nameText, codeText, maxMembersText string) error {
 	host, port, err := parseRelayAddress(relayText)
 	if err != nil {
 		return err
@@ -330,10 +317,20 @@ func (s *session) Connect(join bool, relayText, nameText, codeText string) error
 		s.mu.Unlock()
 		return errors.New("当前已在连接或房间中")
 	}
+	maxMembers := s.maxMembers
+	if !join {
+		parsed, err := parseMaxMembers(maxMembersText)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		maxMembers = parsed
+		s.maxMembers = maxMembers
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.state = stateConnecting
-	s.detail = "正在联系中转服务器…"
+	s.detail = ""
 	s.pcapPath, s.pcapError = "", ""
 	s.pcapPackets, s.pcapDropped = 0, 0
 	hostPCAP := s.hostPCAP
@@ -341,7 +338,7 @@ func (s *session) Connect(join bool, relayText, nameText, codeText string) error
 	s.work.Add(1)
 	s.mu.Unlock()
 	stored := loadConfig()
-	cfg := Config{RelayHost: host, RelayPort: port, DisplayName: name, RelayHistory: stored.RelayHistory, HostPCAP: hostPCAP, HostP2P: hostP2P}
+	cfg := Config{RelayHost: host, RelayPort: port, DisplayName: name, RelayHistory: stored.RelayHistory, HostPCAP: hostPCAP, HostP2P: hostP2P, MaxMembers: maxMembers}
 	go s.connectWorker(ctx, cancel, cfg, code)
 	s.notify()
 	return nil
@@ -353,21 +350,19 @@ func (s *session) connectWorker(ctx context.Context, cancel context.CancelFunc, 
 	if err := saveConfig(cfg); err != nil {
 		s.logWarn("保存配置失败: %v", err)
 	}
-	s.logInfo("正在连接中转 %s", win.FormatRelay(cfg.RelayHost, cfg.RelayPort))
+	s.logInfo("连接 %s", win.FormatRelay(cfg.RelayHost, cfg.RelayPort))
 	if err := s.openRoom(ctx, cfg, code); err != nil {
 		s.mu.Lock()
 		s.cancel = nil
 		message := describeTunnelError(err)
 		if ctx.Err() != nil {
-			s.state, s.detail = stateIdle, "连接已取消。"
+			s.state, s.detail = stateIdle, ""
 		} else {
 			s.state, s.detail = stateFailed, message
 		}
 		cancelled := ctx.Err() != nil
 		s.mu.Unlock()
-		if cancelled {
-			s.logInfo("连接已取消")
-		} else {
+		if !cancelled {
 			s.logAt("ERROR", message)
 		}
 		s.notify()
@@ -393,7 +388,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	client.SetEventHandler(func(ev tunnel.Event) { s.onTunnelEvent(client, ev) })
 	var welcome *protocol.WelcomeMessage
 	if code == "" {
-		welcome, err = client.CreateRoomContext(handshakeCtx, cfg.DisplayName)
+		welcome, err = client.CreateRoomContextMaxMembers(handshakeCtx, cfg.DisplayName, cfg.MaxMembers)
 	} else {
 		welcome, err = client.JoinRoomContext(handshakeCtx, code, cfg.DisplayName)
 	}
@@ -417,7 +412,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	if s.capture {
 		s.mu.Lock()
 		if s.state == stateConnecting {
-			s.detail = "已进入房间，正在启动游戏转发…"
+			s.detail = "启动转发…"
 		}
 		s.mu.Unlock()
 		s.notify()
@@ -432,25 +427,22 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 			return err
 		}
 		if avoidedTUN {
-			s.logInfo("检测到 TUN 虚拟默认路由，回包注入已自动改用物理局域网出口 %s", route.LocalIP)
+			s.logInfo("绕过 TUN，出口 %s", route.LocalIP)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		driverDir, err := win.EnsureDriver()
 		if err != nil {
-			return fmt.Errorf("释放 WinDivert 驱动失败: %w\n驱动目录: %s\n日志: %s", err, win.DriverDir(), s.logLocation())
+			return fmt.Errorf("释放驱动失败: %w (%s)", err, win.DriverDir())
 		}
 		status := win.InspectDriver(driverDir)
-		s.logInfo("驱动目录: %s", driverDir)
-		s.logInfo("WinDivert64.dll: %s", status.DLL.Describe())
-		s.logInfo("WinDivert64.sys: %s", status.SYS.Describe())
 		if !status.Complete {
 			return errors.New(s.driverIncompleteText(status))
 		}
 		if err := win.EnsureFirewallRule(ctx, subnet); err != nil {
 			s.logWarn("%v", err)
-			detail = "防火墙规则配置失败。游戏无法加入时，请查看运行日志或运行诊断。"
+			detail = "防火墙规则配置失败"
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -462,10 +454,10 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 			recorder, err = pcap.NewRecorder(captureDirectory(), welcome.RoomCode)
 			if err != nil {
 				captureError = err.Error()
-				s.logWarn("无法创建本地 PCAP 记录: %v", err)
+				s.logWarn("PCAP 启动失败: %v", err)
 				recorder = nil
 			} else {
-				s.logOK("本房间游戏 UDP 已开始记录: %s", recorder.Path())
+				s.logOK("PCAP: %s", recorder.Path())
 			}
 		}
 		s.activeRecorder.Store(recorder)
@@ -475,7 +467,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 		if err != nil {
 			return errors.New(s.driverFailureText(err, driverDir))
 		}
-		s.logOK("本地出口 %s，虚拟网段 %s", route.LocalIP, subnet)
+		s.logOK("已入房 %s (#%d, 网段 %s, 出口 %s)", welcome.RoomCode, welcome.MemberID, subnet, route.LocalIP)
 	}
 	s.mu.Lock()
 	if ctx.Err() != nil {
@@ -484,7 +476,7 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	}
 	if !client.Connected() {
 		s.mu.Unlock()
-		return errors.New("连接完成前，房间已经关闭")
+		return errors.New("房间已关闭")
 	}
 	s.client, s.bridge, s.recorder, s.subnet = client, bridge, recorder, subnet
 	s.pcapError = captureError
@@ -493,11 +485,13 @@ func (s *session) openRoom(ctx context.Context, cfg Config, code string) error {
 	}
 	s.state, s.detail, s.cancel = stateJoined, detail, nil
 	s.p2pAutoApplied = nil
-	s.peerPaths = [10]tunnel.PeerPath{}
-	s.peerPathsKnown = [10]bool{}
+	s.peerPaths = [protocol.LastMemberID + 1]tunnel.PeerPath{}
+	s.peerPathsKnown = [protocol.LastMemberID + 1]bool{}
 	transferred = true
 	s.mu.Unlock()
-	s.logOK("已进入房间 %s，成员 ID %d", welcome.RoomCode, welcome.MemberID)
+	if !s.capture {
+		s.logOK("已入房 %s (#%d)", welcome.RoomCode, welcome.MemberID)
+	}
 	s.notify()
 	return nil
 }
@@ -587,10 +581,9 @@ func (s *session) maybeAutoEnableP2P(client *tunnel.Client, status tunnel.P2PSta
 		return status
 	}
 	if err := client.SetP2PEnabled(true); err != nil {
-		s.logWarn("按预设自动开启 P2P 直连失败: %v", err)
+		s.logWarn("自动开启 P2P 失败: %v", err)
 		return status
 	}
-	s.logInfo("已按预设偏好自动开启 P2P 直连")
 	return client.P2PStatus()
 }
 
@@ -650,7 +643,7 @@ func (s *session) SetHostPCAP(enabled bool) error {
 			go func() {
 				defer s.work.Done()
 				s.finishCapture(oldRecorder, oldRecorder.Close())
-				s.logInfo("已停止本房间游戏 UDP 记录: %s", oldRecorder.Path())
+				s.logInfo("停止 PCAP: %s", oldRecorder.Path())
 				s.notify()
 			}()
 		} else {
@@ -678,7 +671,7 @@ func (s *session) SetHostPCAP(enabled bool) error {
 			s.pcapError = err.Error()
 		}
 		s.mu.Unlock()
-		s.logWarn("无法创建本地 PCAP 记录: %v", err)
+		s.logWarn("PCAP 启动失败: %v", err)
 		s.notify()
 		return err
 	}
@@ -693,23 +686,23 @@ func (s *session) SetHostPCAP(enabled bool) error {
 	s.pcapPackets, s.pcapDropped, s.pcapError = 0, 0, ""
 	s.activeRecorder.Store(recorder)
 	s.mu.Unlock()
-	s.logOK("本房间游戏 UDP 已开始记录: %s", recorder.Path())
+	s.logOK("PCAP: %s", recorder.Path())
 	s.notify()
 	return nil
 }
 
 func (s *session) RetryP2PFirewall(status tunnel.P2PStatus) error {
 	if !status.Enabled || len(status.Endpoints) == 0 {
-		return errors.New("房主开启 P2P 且检测到对端后，才能配置直连规则。")
+		return errors.New("P2P 未就绪")
 	}
 	s.mu.Lock()
 	if s.quitting {
 		s.mu.Unlock()
-		return errors.New("程序正在退出。")
+		return errors.New("程序正在退出")
 	}
 	if s.p2pFirewallBusy {
 		s.mu.Unlock()
-		return errors.New("P2P 防火墙规则正在配置。")
+		return errors.New("正在同步防火墙规则")
 	}
 	s.p2pFirewallKey = ""
 	s.p2pFirewallError = ""
@@ -764,9 +757,7 @@ func (s *session) SyncP2PFirewall(status tunnel.P2PStatus) {
 		}
 		s.mu.Unlock()
 		if err != nil && key != "" {
-			s.logWarn("P2P 防火墙规则同步失败；软件仍尝试 UDP 直连，失败时自动走中转: %v", err)
-		} else if key != "" {
-			s.logInfo("P2P 防火墙规则同步完成：UDP 本地端口 %d，对端 %d 个", port, len(addresses))
+			s.logWarn("P2P 防火墙同步失败: %v", err)
 		}
 		s.notify()
 	}()
@@ -781,10 +772,10 @@ func (s *session) Disconnect() {
 	}
 	switch s.state {
 	case stateConnecting:
-		s.state, s.detail = stateLeaving, "正在取消连接…"
+		s.state, s.detail = stateLeaving, ""
 		s.cancel()
 	case stateJoined:
-		s.teardownLocked("已离开房间。")
+		s.teardownLocked("")
 	}
 	s.mu.Unlock()
 	s.notify()
@@ -797,14 +788,18 @@ func (s *session) teardownLocked(detail string) {
 	if recorder != nil {
 		s.pcapPath = recorder.Path()
 	}
-	s.state, s.detail = stateLeaving, "正在离开房间…"
-	s.peerPaths = [10]tunnel.PeerPath{}
-	s.peerPathsKnown = [10]bool{}
+	s.state, s.detail = stateLeaving, ""
+	s.peerPaths = [protocol.LastMemberID + 1]tunnel.PeerPath{}
+	s.peerPathsKnown = [protocol.LastMemberID + 1]bool{}
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
 		s.finishCapture(recorder, stopConnection(client, bridge, recorder))
-		s.logInfo("%s", detail)
+		if detail != "" {
+			s.logInfo("%s", detail)
+		} else {
+			s.logInfo("已离开房间")
+		}
 		s.mu.Lock()
 		s.state, s.detail = stateIdle, detail
 		s.mu.Unlock()
@@ -860,12 +855,12 @@ func (s *session) onTunnelEvent(client *tunnel.Client, ev tunnel.Event) {
 		return
 	}
 	if ev.Type == tunnel.EventRoomClosed {
-		reason := "房间已关闭。"
+		reason := "房间已关闭"
 		switch ev.Reason {
 		case "host_left":
-			reason = "房主已离开，房间已关闭。"
+			reason = "房主已离开"
 		case "host_timeout":
-			reason = "房主长时间离线，房间已关闭。"
+			reason = "房主离线超时"
 		}
 		s.teardownLocked(reason)
 	}
@@ -898,7 +893,6 @@ func (s *session) Shutdown() {
 		s.pcapPath = recorder.Path()
 	}
 	s.mu.Unlock()
-	s.logInfo("正在退出，停止会话…")
 	s.finishCapture(recorder, stopConnection(client, bridge, recorder))
 	s.work.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -912,7 +906,7 @@ func (s *session) Shutdown() {
 func (s *session) Snapshot() sessionSnapshot {
 	s.mu.Lock()
 	snap := sessionSnapshot{
-		State: s.state, Detail: s.detail, Capture: s.capture, HostPCAP: s.hostPCAP, HostP2P: s.hostP2P, CivRunning: s.civRunning,
+		State: s.state, Detail: s.detail, Capture: s.capture, HostPCAP: s.hostPCAP, HostP2P: s.hostP2P, MaxMembers: s.maxMembers, CivRunning: s.civRunning,
 		P2PFirewallError: s.p2pFirewallError,
 		PCAPActive:       s.recorder != nil,
 		PCAPPath:         s.pcapPath, PCAPPackets: s.pcapPackets, PCAPDropped: s.pcapDropped, PCAPError: s.pcapError,
@@ -943,6 +937,7 @@ func (s *session) Snapshot() sessionSnapshot {
 	snap.Tunnel = client.Metrics()
 	snap.MemberID = int(client.MemberID())
 	snap.Host = client.IsHost()
+	snap.MaxMembers = client.MaxMembers()
 	snap.P2P = s.maybeAutoEnableP2P(client, client.P2PStatus())
 	snap.RoomCode = client.RoomCode()
 	members := client.Peers()
@@ -970,7 +965,7 @@ func (s *session) Snapshot() sessionSnapshot {
 			if !known || prev != path {
 				s.peerPathsKnown[p.ID] = true
 				s.peerPaths[p.ID] = path
-				if known || path != tunnel.ViaRelay {
+				if path != tunnel.Punching && (known || path != tunnel.ViaRelay) {
 					pathChanges = append(pathChanges, formatPeerPathChange(p.ID, p.Name, path, snap.P2P.PeerRTT[p.ID], snap.P2P.RelayRTT[p.ID]))
 				}
 			}
@@ -1000,7 +995,7 @@ func formatPeerPathChange(id uint8, name string, path tunnel.PeerPath, directRTT
 	case tunnel.Direct:
 		label = "直连"
 	}
-	return fmt.Sprintf("成员 #%d(%s) 路径切换为 %s（直连 RTT=%s，中转 RTT=%s）",
+	return fmt.Sprintf("#%d %s → %s (直连 %s / 中转 %s)",
 		id, name, label, formatOptionalRTT(directRTT), formatOptionalRTT(relayRTT))
 }
 
@@ -1043,21 +1038,21 @@ func describeTunnelError(err error) string {
 	if errors.As(err, &te) {
 		switch te.Code {
 		case "room_not_found":
-			return "房间不存在或已经关闭"
+			return "房间不存在或已关闭"
 		case "room_full":
-			return "房间已满（最多 8 人）"
+			return "房间已满"
 		case "host_offline":
-			return "房主暂时离线"
+			return "房主离线"
 		case "timeout":
-			return "中转服务器没有响应。请检查地址、端口和服务端的 UDP 放行规则。"
+			return "中转无响应"
 		case "roster_too_large":
-			return "房间的昵称总长度超出协议限制。请缩短昵称后重试。"
+			return "昵称总长度超限"
 		case "resolve_failed":
 			return te.Message
 		case "invalid_request":
-			return "参数不正确: " + te.Message
+			return "参数错误: " + te.Message
 		case "closed":
-			return "客户端已关闭"
+			return "已关闭"
 		}
 		return te.Message
 	}

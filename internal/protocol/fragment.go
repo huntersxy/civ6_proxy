@@ -10,6 +10,7 @@ import (
 
 type assemblyKey struct {
 	RoomID     uint64
+	Kind       Kind
 	Source     uint8
 	PacketID   uint32
 	SourcePort uint16
@@ -54,10 +55,12 @@ func (r *Reassembler) SetClock(now func() time.Time) {
 	r.now = now
 }
 
-// Add feeds a DATA frame and returns the complete payload when available.
+// Add feeds a fragmented frame (DATA or control) and returns the complete payload when available.
 func (r *Reassembler) Add(f *Frame) ([]byte, error) {
-	if f.Kind != KindData {
-		return nil, errors.New("only DATA frames can be reassembled")
+	switch f.Kind {
+	case KindData, KindWelcome, KindPeers, KindP2PState:
+	default:
+		return nil, errors.New("frame kind cannot be reassembled")
 	}
 	if f.FragmentCount == 0 || f.FragmentCount > MaxFragmentCount || f.FragmentIndex >= f.FragmentCount {
 		return nil, ErrFragments
@@ -69,7 +72,7 @@ func (r *Reassembler) Add(f *Frame) ([]byte, error) {
 	defer r.mu.Unlock()
 	now := r.now()
 	r.expireLocked(now)
-	key := assemblyKey{f.RoomID, f.SourceMember, f.PacketID, f.SourcePort, f.TargetPort}
+	key := assemblyKey{f.RoomID, f.Kind, f.SourceMember, f.PacketID, f.SourcePort, f.TargetPort}
 	compressed := f.Flags&FlagCompressed != 0
 	entry := r.entries[key]
 	if entry == nil {

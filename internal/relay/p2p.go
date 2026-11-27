@@ -84,8 +84,7 @@ func (r *room) broadcastP2PDisabled(host *member, batch *Batch) {
 		}
 		payload, err := protocol.EncodeControl(protocol.P2PState{Request: peer.p2p.requestSeq})
 		if err == nil {
-			frame := protocol.Frame{Kind: protocol.KindP2PState, RoomID: r.id, Payload: payload}
-			batch.appendSigned(peer, frame)
+			r.appendControl(peer, peer.addr, protocol.KindP2PState, payload, true, batch)
 		}
 	}
 }
@@ -112,6 +111,6 @@ func (r *room) p2pKey(first, second *member) []byte {
 func (r *room) sendP2PState(member *member, addr netip.AddrPort, state protocol.P2PState, batch *Batch) {
 	payload, err := protocol.EncodeControl(state)
 	if err == nil {
-		batch.appendSignedTo(member, addr, protocol.Frame{Kind: protocol.KindP2PState, RoomID: r.id, Payload: payload})
+		r.appendControl(member, addr, protocol.KindP2PState, payload, true, batch)
 	}
 }

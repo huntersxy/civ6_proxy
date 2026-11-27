@@ -25,6 +25,7 @@ type Config struct {
 	RelayHistory []string `json:"relay_history,omitempty"`
 	HostPCAP     bool     `json:"host_pcap,omitempty"`
 	HostP2P      bool     `json:"host_p2p,omitempty"`
+	MaxMembers   int      `json:"max_members,omitempty"`
 }
 
 const maxRelayHistory = 20
@@ -61,6 +62,9 @@ func loadConfig() Config {
 	cfg.RelayHistory = normalizeRelayHistory(stored.RelayHistory)
 	cfg.HostPCAP = stored.HostPCAP
 	cfg.HostP2P = stored.HostP2P
+	if stored.MaxMembers >= 0 && stored.MaxMembers <= protocol.MaxRoomMembers {
+		cfg.MaxMembers = stored.MaxMembers
+	}
 	return cfg
 }
 
@@ -153,28 +157,40 @@ func defaultName() string {
 func parseRelayAddress(value string) (string, int, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "", 0, fmt.Errorf("中转地址不能为空")
+		return "", 0, fmt.Errorf("地址不能为空")
 	}
 	if strings.Contains(value, ":") {
 		host, portText, err := net.SplitHostPort(value)
 		if err != nil {
-			return "", 0, fmt.Errorf("中转地址格式应为 IP:端口，例如 203.0.113.10:42056")
+			return "", 0, fmt.Errorf("格式应为 IP:端口")
 		}
 		host = strings.TrimSpace(host)
 		if host == "" {
-			return "", 0, fmt.Errorf("中转主机不能为空")
+			return "", 0, fmt.Errorf("主机不能为空")
 		}
 		if strings.Contains(host, ":") {
-			return "", 0, fmt.Errorf("中转服务器需要 IPv4 地址或域名")
+			return "", 0, fmt.Errorf("仅支持 IPv4 或域名")
 		}
 		port, err := strconv.Atoi(portText)
 		if err != nil {
-			return "", 0, fmt.Errorf("中转端口必须是数字")
+			return "", 0, fmt.Errorf("端口必须是数字")
 		}
 		if port < 1 || port > 65535 {
-			return "", 0, fmt.Errorf("中转端口必须在 1 到 65535 之间")
+			return "", 0, fmt.Errorf("端口范围 1-65535")
 		}
 		return host, port, nil
 	}
 	return value, defaultRelayPort, nil
+}
+
+func parseMaxMembers(value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" || value == "无限" || value == "不限" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n > protocol.MaxRoomMembers {
+		return 0, fmt.Errorf("人数上限需为 1-%d（留空为无限）", protocol.MaxRoomMembers)
+	}
+	return n, nil
 }

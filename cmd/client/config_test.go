@@ -54,6 +54,7 @@ func TestHostPCAPDefaultsOffAndPersists(t *testing.T) {
 
 	cfg.HostPCAP = true
 	cfg.HostP2P = true
+	cfg.MaxMembers = 12
 	if err := saveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -63,5 +64,35 @@ func TestHostPCAPDefaultsOffAndPersists(t *testing.T) {
 	}
 	if !reloaded.HostP2P {
 		t.Fatalf("expected saved HostP2P=true to persist")
+	}
+	if reloaded.MaxMembers != 12 {
+		t.Fatalf("expected saved MaxMembers=12 to persist, got %d", reloaded.MaxMembers)
+	}
+}
+
+func TestParseMaxMembers(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"  ", 0, false},
+		{"0", 0, false},
+		{"无限", 0, false},
+		{"不限", 0, false},
+		{"8", 8, false},
+		{"253", 253, false},
+		{"-1", 0, true},
+		{"254", 0, true},
+		{"abc", 0, true},
+	} {
+		got, err := parseMaxMembers(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("parseMaxMembers(%q): err=%v wantErr=%v", tc.in, err, tc.wantErr)
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Fatalf("parseMaxMembers(%q) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }

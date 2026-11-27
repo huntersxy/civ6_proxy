@@ -19,19 +19,21 @@ type HandshakeRequest struct {
 	RequestID    string `json:"request_id"`
 	Name         string `json:"name"`
 	RoomCode     string `json:"room_code,omitempty"`
+	MaxMembers   int    `json:"max_members,omitempty"`
 	ResumeMember uint8  `json:"resume_member,omitempty"`
 	ResumeToken  string `json:"resume_token,omitempty"`
 }
 
 // WelcomeMessage is the WELCOME payload.
 type WelcomeMessage struct {
-	RequestID string `json:"request_id"`
-	RoomCode  string `json:"room_code"`
-	RoomID    string `json:"room_id"`
-	MemberID  uint8  `json:"member_id"`
-	Host      bool   `json:"host"`
-	Token     string `json:"token"`
-	Members   []Peer `json:"members"`
+	RequestID  string `json:"request_id"`
+	RoomCode   string `json:"room_code"`
+	RoomID     string `json:"room_id"`
+	MemberID   uint8  `json:"member_id"`
+	Host       bool   `json:"host"`
+	MaxMembers int    `json:"max_members,omitempty"`
+	Token      string `json:"token"`
+	Members    []Peer `json:"members"`
 }
 
 // PeerListMessage is the PEERS payload.

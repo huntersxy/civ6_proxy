@@ -27,8 +27,11 @@ func (s *Server) handleHandshake(frame *protocol.Frame, addr netip.AddrPort, siz
 	}
 	key := handshakeKey{endpoint: addr, kind: frame.Kind, requestID: requestID}
 	if cached, ok := s.handshakeCache[key]; ok && cached.expires > now {
-		batch.buffer = append(batch.buffer, cached.data...)
-		batch.Datagrams = append(batch.Datagrams, Outbound{Addr: addr, Data: batch.buffer[:len(batch.buffer):len(batch.buffer)]})
+		for _, dg := range cached.datagrams {
+			offset := len(batch.buffer)
+			batch.buffer = append(batch.buffer, dg...)
+			batch.Datagrams = append(batch.Datagrams, Outbound{Addr: addr, Data: batch.buffer[offset:len(batch.buffer):len(batch.buffer)]})
+		}
 		return
 	}
 	if frame.Kind == protocol.KindCreate {
@@ -36,8 +39,15 @@ func (s *Server) handleHandshake(frame *protocol.Frame, addr netip.AddrPort, siz
 	} else {
 		s.joinRoom(&req, requestID, addr, batch)
 	}
-	if len(batch.Datagrams) > 0 {
-		s.handshakeCache[key] = cachedHandshake{expires: now + handshakeTTLSec, data: bytes.Clone(batch.Datagrams[0].Data)}
+	var cachedDatagrams [][]byte
+	for _, out := range batch.Datagrams {
+		if out.Addr == addr && len(out.Data) > 5 &&
+			(out.Data[5] == byte(protocol.KindWelcome) || out.Data[5] == byte(protocol.KindError)) {
+			cachedDatagrams = append(cachedDatagrams, bytes.Clone(out.Data))
+		}
+	}
+	if len(cachedDatagrams) > 0 {
+		s.handshakeCache[key] = cachedHandshake{expires: now + handshakeTTLSec, datagrams: cachedDatagrams}
 	}
 }
 
@@ -45,6 +55,10 @@ func (s *Server) createRoom(req *protocol.HandshakeRequest, requestID string, ad
 	name, err := protocol.NormalizeName(req.Name)
 	if err != nil {
 		batch.appendError(addr, requestID, "invalid_request", err.Error())
+		return
+	}
+	if req.MaxMembers < 0 || req.MaxMembers > protocol.MaxRoomMembers {
+		batch.appendError(addr, requestID, "invalid_request", fmt.Sprintf("max_members must be 0 (unlimited) or 1..%d", protocol.MaxRoomMembers))
 		return
 	}
 	s.roomsMu.Lock()
@@ -59,13 +73,13 @@ func (s *Server) createRoom(req *protocol.HandshakeRequest, requestID string, ad
 	var token [32]byte
 	copy(token[:], protocol.RandomBytes(32))
 	host := newMember(firstMemberID, name, token, addr, true, now, s.limit)
-	r := &room{id: roomID, code: code, members: [maxRoomMembers]*member{host}}
+	r := &room{id: roomID, code: code, maxMembers: req.MaxMembers, members: []*member{host}}
 	r.appendWelcome(host, requestID, batch)
 	s.roomsByID[roomID] = r
 	s.roomsByCode[code] = r
 	s.memberCount.Add(1)
 	s.roomsMu.Unlock()
-	s.log.Printf("room created room=%s member=%d endpoint=%s", code, host.id, addr.Addr())
+	s.log.Printf("room created room=%s member=%d max=%d endpoint=%s", code, host.id, req.MaxMembers, addr.Addr())
 }
 
 func (s *Server) joinRoom(req *protocol.HandshakeRequest, requestID string, addr netip.AddrPort, batch *Batch) {
@@ -99,7 +113,7 @@ func (s *Server) joinRoom(req *protocol.HandshakeRequest, requestID string, addr
 	}
 	slot := r.nextSlot()
 	if slot < 0 {
-		batch.appendError(addr, requestID, "room_full", "room already has eight members")
+		batch.appendError(addr, requestID, "room_full", fmt.Sprintf("room is full (limit %d)", r.effectiveLimit()))
 		return
 	}
 	name, err := protocol.NormalizeName(req.Name)
@@ -109,7 +123,7 @@ func (s *Server) joinRoom(req *protocol.HandshakeRequest, requestID string, addr
 	}
 	var token [32]byte
 	copy(token[:], protocol.RandomBytes(32))
-	m := newMember(uint8(slot+firstMemberID), name, token, addr, false, s.clock(), s.limit)
+	m := newMember(uint8(slot+int(firstMemberID)), name, token, addr, false, s.clock(), s.limit)
 	r.members[slot] = m
 	if !r.appendWelcome(m, requestID, batch) {
 		r.members[slot] = nil
@@ -152,26 +166,19 @@ func decodeToken(encoded string) ([]byte, error) {
 
 func (r *room) appendWelcome(m *member, requestID string, batch *Batch) bool {
 	payload, err := protocol.EncodeControl(protocol.WelcomeMessage{
-		RequestID: requestID,
-		RoomCode:  r.code,
-		RoomID:    fmt.Sprintf("%016x", r.id),
-		MemberID:  m.id,
-		Host:      m.isHost,
-		Token:     base64.URLEncoding.EncodeToString(m.token[:]),
-		Members:   r.peerList(),
+		RequestID:  requestID,
+		RoomCode:   r.code,
+		RoomID:     fmt.Sprintf("%016x", r.id),
+		MemberID:   m.id,
+		Host:       m.isHost,
+		MaxMembers: r.maxMembers,
+		Token:      base64.URLEncoding.EncodeToString(m.token[:]),
+		Members:    r.peerList(),
 	})
-	const longestRequestID = 64
-	if err != nil || len(payload)+longestRequestID-len(requestID)+maxRoomMembers > protocol.MaxFragmentPayload {
+	if err != nil {
 		return false
 	}
-	frame := protocol.Frame{
-		Kind:         protocol.KindWelcome,
-		RoomID:       r.id,
-		SourceMember: 0,
-		TargetMember: m.id,
-		Payload:      payload,
-	}
-	return batch.appendFrame(m.addr, frame, nil)
+	return r.appendControl(m, m.addr, protocol.KindWelcome, payload, false, batch)
 }
 
 func (b *Batch) appendError(addr netip.AddrPort, requestID, code, message string) {

@@ -27,14 +27,14 @@ func (a *clientApp) diagnosticsCard(w *gui.Window) gui.View {
 	t := gui.CurrentTheme()
 	d := &a.diag
 
-	statusLabel, statusVariant := "尚未运行", gui.BadgeDefault
+	statusLabel, statusVariant := "未运行", gui.BadgeDefault
 	if d.busy {
-		statusLabel, statusVariant = "正在诊断…", gui.BadgeInfo
+		statusLabel, statusVariant = "诊断中…", gui.BadgeInfo
 	} else if d.hasResult {
 		if d.ok {
-			statusLabel, statusVariant = "诊断通过", gui.BadgeSuccess
+			statusLabel, statusVariant = "通过", gui.BadgeSuccess
 		} else {
-			statusLabel, statusVariant = "发现问题", gui.BadgeError
+			statusLabel, statusVariant = "异常", gui.BadgeError
 		}
 	}
 
@@ -46,9 +46,9 @@ func (a *clientApp) diagnosticsCard(w *gui.Window) gui.View {
 		gui.Row(gui.ContainerCfg{Sizing: gui.FillFit, Padding: gui.NoPadding, SizeBorder: gui.NoBorder}),
 	}
 	if d.hasResult && d.report != "" {
-		toggleText := "展开完整报告"
+		toggleText := "完整报告"
 		if d.showFull {
-			toggleText = "收起完整报告"
+			toggleText = "收起报告"
 		}
 		actions = append(actions,
 			gui.Button(gui.ButtonCfg{
@@ -103,16 +103,10 @@ func (a *clientApp) diagnosticsCard(w *gui.Window) gui.View {
 		}),
 	}
 
-	if !d.hasResult {
-		items = append(items, gui.Text(gui.TextCfg{
-			Text:      "检查 WinDivert 驱动完整性、服务状态、Windows Defender 隔离与排除项、中转解析与防火墙规则。",
-			TextStyle: t.TextStyleSecondary,
-			Mode:      gui.TextModeWrap,
-		}))
-	} else {
+	if d.hasResult {
 		summaryText := d.summary
 		if d.reportPath != "" {
-			summaryText += "\n报告路径: " + d.reportPath
+			summaryText += "\n报告: " + d.reportPath
 		}
 		items = append(items, subtlePanelView("diag-summary-box", gui.FillFit,
 			gui.Text(gui.TextCfg{
@@ -194,7 +188,6 @@ func (a *clientApp) logsCard(w *gui.Window) gui.View {
 					}
 					text, _ := app.s.logSnapshot(-1)
 					ctx.Window.SetClipboard(text)
-					app.toast(ctx.Window, gui.ToastSuccess, "日志已复制", fmt.Sprintf("已复制 %d 条日志到剪贴板。", len(app.logEntries)))
 				},
 			}),
 			gui.Button(gui.ButtonCfg{

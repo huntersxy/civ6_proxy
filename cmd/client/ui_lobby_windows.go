@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,11 +45,13 @@ func (a *clientApp) lobbyStatusBanner(w *gui.Window) gui.View {
 				gui.Badge(gui.BadgeCfg{Label: title, Variant: variant}),
 			},
 		}),
-		gui.Text(gui.TextCfg{
+	}
+	if detail != "" {
+		headerLeft = append(headerLeft, gui.Text(gui.TextCfg{
 			Text:      detail,
 			TextStyle: t.TextStyleSecondary,
 			Mode:      gui.TextModeWrap,
-		}),
+		}))
 	}
 
 	bannerContent := []gui.View{
@@ -125,7 +128,7 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 		gui.Input(gui.InputCfg{
 			ID:          "relay-input",
 			Text:        a.relayText,
-			Placeholder: "例如 203.0.113.10:42056",
+			Placeholder: "IP:端口",
 			MaxLength:   255,
 			Disabled:    !canConnect,
 			Sizing:      gui.FillFit,
@@ -174,7 +177,7 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 				SizeBorder: gui.NoBorder,
 				Content: []gui.View{
 					gui.Text(gui.TextCfg{
-						Text:      "历史中转地址",
+						Text:      "历史记录",
 						TextStyle: t.TextStyleCaption,
 					}),
 				},
@@ -265,6 +268,15 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 		}))
 	}
 
+	maxMembersDisplay := a.maxMembersText
+	if joined {
+		if a.snap.MaxMembers > 0 {
+			maxMembersDisplay = strconv.Itoa(a.snap.MaxMembers)
+		} else {
+			maxMembersDisplay = "无限"
+		}
+	}
+
 	row1 := gui.Row(gui.ContainerCfg{
 		Sizing:     gui.FillFit,
 		Padding:    gui.NoPadding,
@@ -290,7 +302,7 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 				},
 			}),
 			gui.Column(gui.ContainerCfg{
-				Width:      220,
+				Width:      180,
 				Sizing:     gui.FixedFit,
 				Padding:    gui.NoPadding,
 				SizeBorder: gui.NoBorder,
@@ -300,13 +312,42 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 					gui.Input(gui.InputCfg{
 						ID:          "name-input",
 						Text:        a.nameText,
-						Placeholder: "游戏内显示昵称",
+						Placeholder: "昵称",
 						MaxLength:   48,
 						Disabled:    !canConnect,
 						Sizing:      gui.FillFit,
 						OnTextChanged: func(val string, ctx gui.EventCtx) {
 							ctx.Consume()
 							gui.State[clientApp](ctx.Window).nameText = val
+							ctx.Window.InvalidateLayout()
+						},
+						OnEnter: func(ctx gui.EventCtx) {
+							ctx.Consume()
+							if ids := ctx.Window.ResolveID("create-room"); len(ids) > 0 {
+								ctx.Window.SetFocus(ids[0])
+							}
+						},
+					}),
+				},
+			}),
+			gui.Column(gui.ContainerCfg{
+				Width:      104,
+				Sizing:     gui.FixedFit,
+				Padding:    gui.NoPadding,
+				SizeBorder: gui.NoBorder,
+				Spacing:    gui.SpacingPx(4),
+				Content: []gui.View{
+					gui.Text(gui.TextCfg{Text: "人数上限", TextStyle: t.TextStyleLabel}),
+					gui.Input(gui.InputCfg{
+						ID:          "max-members-input",
+						Text:        maxMembersDisplay,
+						Placeholder: "无限",
+						MaxLength:   8,
+						Disabled:    !canConnect,
+						Sizing:      gui.FillFit,
+						OnTextChanged: func(val string, ctx gui.EventCtx) {
+							ctx.Consume()
+							gui.State[clientApp](ctx.Window).maxMembersText = val
 							ctx.Window.InvalidateLayout()
 						},
 						OnEnter: func(ctx gui.EventCtx) {
@@ -370,7 +411,7 @@ func (a *clientApp) lobbyConnectionCard(w *gui.Window) gui.View {
 			gui.Input(gui.InputCfg{
 				ID:          "room-code",
 				Text:        roomCodeValue,
-				Placeholder: "输入 10 位房间码",
+				Placeholder: "10 位房间码",
 				MaxLength:   64,
 				ReadOnly:    !canConnect,
 				TextStyle:   t.TextStyleCode,
@@ -434,7 +475,7 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 	joined := snap.State == stateJoined
 
 	p2pSelected := a.hostP2P
-	status := "未开启（可提前开启，建房后对支持的中转自动生效）"
+	status := "关闭"
 	statusStyle := t.TextStyleSecondary
 	canToggle := !a.closing && !a.diag.busy && snap.State != stateConnecting && snap.State != stateLeaving
 	if joined {
@@ -442,11 +483,11 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 		canToggle = snap.Host && snap.P2P.Supported && !a.closing
 		switch {
 		case snap.P2P.Checking:
-			status = "正在检测中转支持…"
+			status = "检测中…"
 		case !snap.P2P.Supported:
-			status = "当前中转不支持直连"
+			status = "中转不支持"
 		case snap.P2P.Pending:
-			status = "等待中转确认…"
+			status = "等待确认…"
 		case snap.P2P.Enabled:
 			direct, punching, total := 0, 0, 0
 			for _, peer := range snap.Members {
@@ -459,35 +500,35 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 					}
 				}
 			}
-			status = "已开启，等待其他玩家"
+			status = "已开启"
 			if total != 0 {
 				if direct == 0 && punching == 0 {
-					status = fmt.Sprintf("直连未建立，可能受 NAT/运营商 UDP 限制（%d 人）", total)
+					status = fmt.Sprintf("直连失败 · %d 人", total)
 					statusStyle = t.TextStyleWarning
 				} else {
-					status = fmt.Sprintf("%d / %d 位玩家已直连", direct, total)
+					status = fmt.Sprintf("直连 %d/%d", direct, total)
 					statusStyle = t.TextStyleSuccess
 				}
 				if punching > 0 {
-					status += fmt.Sprintf("，%d 位正在打洞", punching)
+					status += fmt.Sprintf(" · 打洞 %d", punching)
 				} else if direct < total && direct != 0 {
-					status += "，其余走中转"
+					status += " · 其余中转"
 				}
 			}
 			if snap.P2PFirewallError != "" {
-				status += " · 规则未同步，仍会尝试直连"
+				status += " · 防火墙未同步"
 				statusStyle = t.TextStyleWarning
 			}
 		case snap.P2PFirewallError != "":
-			status = "防火墙规则未同步；直连失败时自动走中转"
+			status = "防火墙未同步"
 			statusStyle = t.TextStyleWarning
 		case !snap.Host:
-			status = "房主未开启"
+			status = "房主未开"
 		default:
-			status = "已关闭"
+			status = "关闭"
 		}
 	} else if a.hostP2P {
-		status = "已开启：建房后若中转支持，将自动启用 P2P 直连"
+		status = "开启（建房后自动启用）"
 		statusStyle = t.TextStyleSuccess
 	}
 
@@ -495,34 +536,34 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 
 	hostPCAPSelected := a.hostPCAP
 	canTogglePCAP := !a.closing && !a.diag.busy && snap.State != stateConnecting && snap.State != stateLeaving
-	pcapStatus := "默认关闭；仅需排查联机丢包或异常时再由房主开启"
+	pcapStatus := "关闭"
 	pcapStatusStyle := t.TextStyleSecondary
 	if joined {
 		switch {
 		case !snap.Host:
 			canTogglePCAP = false
-			pcapStatus = "仅房主端支持自动抓包（当前为成员）"
+			pcapStatus = "仅房主可用"
 		case !snap.Capture:
 			canTogglePCAP = false
-			pcapStatus = "当前为隧道测试模式，游戏流量未接入"
+			pcapStatus = "测试模式不可用"
 		case snap.PCAPError != "":
-			pcapStatus = "本地 PCAP 记录异常，请查看运行日志"
+			pcapStatus = "PCAP 异常"
 			pcapStatusStyle = t.TextStyleError
 		case hostPCAPSelected && snap.PCAPActive:
-			pcapStatus = fmt.Sprintf("正在记录游戏 UDP（已写入 %d 包），自动保留 72 小时", snap.PCAPPackets)
+			pcapStatus = fmt.Sprintf("记录中 · %d 包", snap.PCAPPackets)
 			pcapStatusStyle = t.TextStyleSuccess
 		case hostPCAPSelected:
-			pcapStatus = "已开启，正在准备本地 PCAP 记录…"
+			pcapStatus = "准备中…"
 		case snap.PCAPPath != "":
-			pcapStatus = fmt.Sprintf("已关闭（本次已停止，共记录 %d 包）", snap.PCAPPackets)
+			pcapStatus = fmt.Sprintf("已停止 · %d 包", snap.PCAPPackets)
 		default:
-			pcapStatus = "已关闭（开启后将记录原始游戏 UDP 到本地目录）"
+			pcapStatus = "关闭"
 		}
 	} else if a.s != nil && !snap.Capture {
 		canTogglePCAP = false
-		pcapStatus = "当前为隧道测试模式，游戏流量未接入"
+		pcapStatus = "测试模式不可用"
 	} else if hostPCAPSelected {
-		pcapStatus = "已开启：建房后仅房主自动记录原始游戏 UDP（保留 72 小时）"
+		pcapStatus = "开启（建房自动记录）"
 		pcapStatusStyle = t.TextStyleSuccess
 	}
 
@@ -535,7 +576,7 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 		Content: []gui.View{
 			gui.Switch(gui.SwitchCfg{
 				ID:       "p2p-switch",
-				Label:    "启用 P2P 直连",
+				Label:    "P2P 直连",
 				Selected: p2pSelected,
 				Disabled: !canToggle,
 				OnClick: func(ctx gui.EventCtx) {
@@ -573,7 +614,7 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 			}),
 			gui.Button(gui.ButtonCfg{
 				ID:       "p2p-firewall",
-				Label:    "配置 P2P 防火墙",
+				Label:    "P2P 防火墙",
 				Variant:  gui.ButtonSecondary,
 				Disabled: !canFirewall,
 				OnClick: func(ctx gui.EventCtx) {
@@ -584,8 +625,6 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 					}
 					if err := app.s.RetryP2PFirewall(app.snap.P2P); err != nil {
 						app.toast(ctx.Window, gui.ToastWarning, "同步失败", err.Error())
-					} else {
-						app.toast(ctx.Window, gui.ToastInfo, "防火墙规则同步中", "正在为本机 UDP 端口和已验证对端同步规则。")
 					}
 					app.syncSnapshot(ctx.Window)
 				},
@@ -602,7 +641,7 @@ func (a *clientApp) lobbyP2PCard(w *gui.Window) gui.View {
 		Content: []gui.View{
 			gui.Switch(gui.SwitchCfg{
 				ID:       "host-pcap-switch",
-				Label:    "房主自动抓包",
+				Label:    "房主抓包",
 				Selected: hostPCAPSelected,
 				Disabled: !canTogglePCAP,
 				OnClick: func(ctx gui.EventCtx) {
@@ -661,7 +700,11 @@ func (a *clientApp) lobbyMembersCard(w *gui.Window) gui.View {
 	rosterLabel := "尚无成员"
 	rosterVariant := gui.BadgeDefault
 	if len(members) > 0 {
-		rosterLabel = fmt.Sprintf("%d / %d 在线", online, len(members))
+		if a.snap.MaxMembers > 0 {
+			rosterLabel = fmt.Sprintf("%d / %d 在线 · 上限 %d", online, len(members), a.snap.MaxMembers)
+		} else {
+			rosterLabel = fmt.Sprintf("%d / %d 在线 · 无限", online, len(members))
+		}
 		rosterVariant = gui.BadgeSuccess
 	}
 
@@ -691,16 +734,10 @@ func (a *clientApp) lobbyMembersCard(w *gui.Window) gui.View {
 			VAlign:     gui.VAlignMiddle,
 			Padding:    gui.NewPadding(20, 16, 20, 16),
 			SizeBorder: gui.NoBorder,
-			Spacing:    gui.SpacingSmall,
 			Content: []gui.View{
 				gui.Text(gui.TextCfg{
-					Text:      "当前尚未加入房间",
-					TextStyle: t.TextStyleBodyLarge.Bold(),
-				}),
-				gui.Text(gui.TextCfg{
-					Text:      "填写中转地址与昵称后，点击「创建房间」或输入朋友的 10 位房间码加入。",
+					Text:      "未加入房间",
 					TextStyle: t.TextStyleSecondary,
-					Mode:      gui.TextModeWrap,
 				}),
 			},
 		})

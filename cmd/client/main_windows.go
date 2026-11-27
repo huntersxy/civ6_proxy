@@ -37,13 +37,13 @@ func main() {
 				return
 			} else {
 				messageBox("需要管理员权限",
-					fmt.Sprintf("Civ6Relay 需要管理员权限来加载 WinDivert 驱动并配置游戏入站防火墙规则。\n\n未能获取管理员权限：%v\n\n请右键程序选择“以管理员身份运行”后重试。", err),
+					fmt.Sprintf("需要管理员权限以加载 WinDivert 驱动：%v\n请右键「以管理员身份运行」。", err),
 					mbOK|mbIconError)
 				return
 			}
 		}
 		messageBox("需要管理员权限",
-			"Civ6Relay 需要管理员权限来加载 WinDivert 驱动并配置游戏入站防火墙规则。\n\n尝试提权后仍未获取到管理员权限，请检查系统 UAC 设置或右键“以管理员身份运行”。",
+			"未能获取管理员权限，请右键「以管理员身份运行」。",
 			mbOK|mbIconError)
 		return
 	}
@@ -57,13 +57,12 @@ func main() {
 	}
 
 	cfg := loadConfig()
-	s := newSession(!*noCapture, cfg.HostPCAP, cfg.HostP2P)
+	s := newSession(!*noCapture, cfg.HostPCAP, cfg.HostP2P, cfg.MaxMembers)
 	defer s.CloseLog()
 	if err := runNativeUI(s, cfg); err != nil {
 		s.logError("创建主窗口失败: %v", err)
 		messageBox("启动失败", fmt.Sprintf("无法创建窗口: %v", err), mbOK|mbIconError)
 	}
-	s.logInfo("程序退出")
 }
 
 func buildRelaunchArgs(diag, noCapture bool) string {

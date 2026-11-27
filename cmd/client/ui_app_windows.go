@@ -48,12 +48,13 @@ type clientApp struct {
 	page navPage
 
 	// Form inputs
-	relayText    string
-	relayHistory []string
-	historyOpen  bool
-	nameText     string
-	joinDraft    string
-	activeCode   string
+	relayText      string
+	relayHistory   []string
+	historyOpen    bool
+	nameText       string
+	maxMembersText string
+	joinDraft      string
+	activeCode     string
 
 	// Cached session snapshot & log entries
 	snap       sessionSnapshot
@@ -65,28 +66,35 @@ type clientApp struct {
 	autoScroll bool
 
 	// Transient states
-	closing    bool
-	exportBusy bool
-	diag       diagState
-	netTest    netTestState
-	syncFixMod syncFixModStatus
-	openPathFn func(string) error       // optional test override for openFolder
-	modsRootFn func() (string, error)   // optional test override for defaultCiv6ModsRoot
+	closing         bool
+	exportBusy      bool
+	diag            diagState
+	netTest         netTestState
+	syncFixMod      syncFixModStatus
+	openPathFn      func(string) error     // optional test override for openFolder
+	openURLFn       func(string) error     // optional test override for openURL
+	modsRootFn      func() (string, error) // optional test override for defaultCiv6ModsRoot
+	workshopRootsFn func() []string        // optional test override for defaultSteamLibraryRoots
 
 	refreshQueued atomic.Bool
 	stopped       atomic.Bool
 }
 
 func newClientApp(s *session, cfg Config) *clientApp {
+	maxMembersText := ""
+	if cfg.MaxMembers > 0 {
+		maxMembersText = strconv.Itoa(cfg.MaxMembers)
+	}
 	app := &clientApp{
-		s:            s,
-		page:         pageLobby,
-		relayText:    win.FormatRelay(cfg.RelayHost, cfg.RelayPort),
-		relayHistory: append([]string(nil), cfg.RelayHistory...),
-		nameText:     cfg.DisplayName,
-		hostPCAP:     cfg.HostPCAP,
-		hostP2P:      cfg.HostP2P,
-		autoScroll:   true,
+		s:              s,
+		page:           pageLobby,
+		relayText:      win.FormatRelay(cfg.RelayHost, cfg.RelayPort),
+		relayHistory:   append([]string(nil), cfg.RelayHistory...),
+		nameText:       cfg.DisplayName,
+		maxMembersText: maxMembersText,
+		hostPCAP:       cfg.HostPCAP,
+		hostP2P:        cfg.HostP2P,
+		autoScroll:     true,
 	}
 	app.netTest.init()
 	app.refreshSyncFixStatus()
@@ -232,7 +240,6 @@ func (a *clientApp) syncSnapshot(w *gui.Window) {
 
 	if prevState == stateConnecting && snap.State == stateJoined && snap.RoomCode != "" {
 		a.relayHistory = loadConfig().RelayHistory
-		a.toast(w, gui.ToastSuccess, "已进入房间", "房间码 "+snap.RoomCode+" 已就绪，可复制分享给朋友。")
 	}
 
 	if entries, seq, changed := a.s.logEntries(a.logSeq); changed {
@@ -279,7 +286,7 @@ func (a *clientApp) connect(w *gui.Window, join bool) {
 		return
 	}
 	a.historyOpen = false
-	if err := a.s.Connect(join, a.relayText, a.nameText, a.joinDraft); err != nil {
+	if err := a.s.Connect(join, a.relayText, a.nameText, a.joinDraft, a.maxMembersText); err != nil {
 		a.toast(w, gui.ToastWarning, "无法发起连接", err.Error())
 		return
 	}
@@ -291,7 +298,6 @@ func (a *clientApp) copyRoomCode(w *gui.Window) {
 		return
 	}
 	w.SetClipboard(a.activeCode)
-	a.toast(w, gui.ToastSuccess, "房间码已复制", a.activeCode)
 }
 
 func (a *clientApp) runDiagnostics(w *gui.Window) {
@@ -319,10 +325,8 @@ func (a *clientApp) runDiagnostics(w *gui.Window) {
 			if app.closing {
 				return
 			}
-			if ok {
-				app.toast(vw, gui.ToastSuccess, "诊断通过", "WinDivert 驱动和网络环境正常。")
-			} else {
-				app.toast(vw, gui.ToastError, "诊断发现问题", "请查看下方诊断结果与完整报告。")
+			if !ok {
+				app.toast(vw, gui.ToastError, "诊断发现问题", "请查看下方诊断结果")
 			}
 			vw.InvalidateLayout()
 		})
@@ -352,9 +356,7 @@ func (a *clientApp) exportLog(w *gui.Window) {
 			}
 			if saveErr != nil {
 				app.s.logError("导出日志失败: %v", saveErr)
-				app.toast(vw, gui.ToastError, "导出失败", "请检查保存目录的写入权限。")
-			} else {
-				app.toast(vw, gui.ToastSuccess, "运行日志已导出", path)
+				app.toast(vw, gui.ToastError, "导出失败", saveErr.Error())
 			}
 			vw.InvalidateLayout()
 		})
@@ -364,22 +366,10 @@ func (a *clientApp) exportLog(w *gui.Window) {
 func (a *clientApp) openCapturesDir(w *gui.Window) {
 	dir := captureDirectory()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		a.toast(w, gui.ToastError, "打开失败", "无法创建抓包目录，请检查本地磁盘权限。")
-		return
-	}
-	if a.openPathFn != nil {
-		if err := a.openPathFn(dir); err != nil {
-			a.toast(w, gui.ToastError, "打开失败", err.Error())
-			return
-		}
-		a.toast(w, gui.ToastInfo, "本地抓包目录已打开", dir)
-		return
-	}
-	if err := openFolder(dir); err != nil {
 		a.toast(w, gui.ToastError, "打开失败", err.Error())
 		return
 	}
-	a.toast(w, gui.ToastInfo, "本地抓包目录已打开", dir)
+	a.openPath(w, dir)
 }
 
 func (a *clientApp) modsRoot() (string, error) {
@@ -389,29 +379,46 @@ func (a *clientApp) modsRoot() (string, error) {
 	return defaultCiv6ModsRoot()
 }
 
-func (a *clientApp) refreshSyncFixStatus() {
-	root, err := a.modsRoot()
-	if err != nil {
-		a.syncFixMod = syncFixModStatus{Err: err.Error()}
-		return
+func (a *clientApp) steamLibraryRoots() []string {
+	if a.workshopRootsFn != nil {
+		return a.workshopRootsFn()
 	}
-	a.syncFixMod = inspectSyncFixMod(root)
+	return defaultSteamLibraryRoots()
 }
 
-func (a *clientApp) openPath(w *gui.Window, dir, title string) {
-	if a.openPathFn != nil {
-		if err := a.openPathFn(dir); err != nil {
-			a.toast(w, gui.ToastError, "打开失败", err.Error())
-			return
+func (a *clientApp) refreshSyncFixStatus() {
+	roots := a.steamLibraryRoots()
+	modRoot, err := a.modsRoot()
+	if err != nil {
+		st := syncFixModStatus{Err: err.Error()}
+		if workshopDir, ok := findWorkshopModDir(roots, civ6SteamAppID, syncFixWorkshopID); ok {
+			st.WorkshopDir = workshopDir
+			st.WorkshopInstalled = true
 		}
-		a.toast(w, gui.ToastInfo, title, dir)
+		a.syncFixMod = st
 		return
 	}
-	if err := openFolder(dir); err != nil {
+	a.syncFixMod = inspectSyncFixMod(modRoot, roots)
+}
+
+func (a *clientApp) openWorkshopURL(w *gui.Window) {
+	openFn := openURL
+	if a.openURLFn != nil {
+		openFn = a.openURLFn
+	}
+	if err := openFn(syncFixWorkshopURL); err != nil {
 		a.toast(w, gui.ToastError, "打开失败", err.Error())
-		return
 	}
-	a.toast(w, gui.ToastInfo, title, dir)
+}
+
+func (a *clientApp) openPath(w *gui.Window, dir string) {
+	openFn := openFolder
+	if a.openPathFn != nil {
+		openFn = a.openPathFn
+	}
+	if err := openFn(dir); err != nil {
+		a.toast(w, gui.ToastError, "打开失败", err.Error())
+	}
 }
 
 func (a *clientApp) installSyncFixFromUI(w *gui.Window) {
@@ -424,17 +431,16 @@ func (a *clientApp) installSyncFixFromUI(w *gui.Window) {
 	a.refreshSyncFixStatus()
 	if err != nil {
 		if a.s != nil {
-			a.s.logError("安装同步修复 Mod 失败: %v", err)
+			a.s.logError("安装 Civ6SyncFix 失败: %v", err)
 		}
-		a.toast(w, gui.ToastError, "同步修复 Mod 安装失败", err.Error())
+		a.toast(w, gui.ToastError, "安装失败", err.Error())
 		w.InvalidateLayout()
 		return
 	}
 	if a.s != nil {
-		a.s.logOK("已安装同步修复 Mod 到 %s", installDir)
+		a.s.logOK("已安装 Civ6SyncFix: %s", installDir)
 	}
 	w.DialogDismiss()
-	a.toast(w, gui.ToastSuccess, "同步修复 Mod 安装成功", "请确保已取消订阅旧版 FastSync，并在游戏「额外内容 › 模组」勾选 Civ6SyncFix。")
 	w.InvalidateLayout()
 }
 
@@ -446,17 +452,16 @@ func (a *clientApp) uninstallSyncFixFromUI(w *gui.Window) {
 	}
 	if err := uninstallSyncFixMod(root); err != nil {
 		if a.s != nil {
-			a.s.logError("卸载同步修复 Mod 失败: %v", err)
+			a.s.logError("卸载 Civ6SyncFix 失败: %v", err)
 		}
 		a.toast(w, gui.ToastError, "卸载失败", err.Error())
 		return
 	}
 	a.refreshSyncFixStatus()
 	if a.s != nil {
-		a.s.logInfo("已卸载同步修复 Mod (%s)", a.syncFixMod.InstallDir)
+		a.s.logInfo("已卸载 Civ6SyncFix")
 	}
 	w.DialogDismiss()
-	a.toast(w, gui.ToastInfo, "同步修复 Mod 已卸载", "已移除本地 Civ6SyncFix 模组目录。")
 	w.InvalidateLayout()
 }
 
@@ -469,28 +474,42 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 	w.Dialog(gui.DialogCfg{
 		ID:         "syncfix-dialog",
 		DialogType: gui.DialogCustom,
-		Title:      "一键安装同步修复 Mod（Civ6SyncFix）",
-		Width:      500,
+		Title:      "Civ6SyncFix",
+		Width:      520,
 		FocusID:    "syncfix-confirm-install",
 		CustomView: func(vw *gui.Window) gui.View {
 			app := gui.State[clientApp](vw)
 			t := gui.CurrentTheme()
 			st := app.syncFixMod
 
-			statusLabel := "尚未安装"
-			statusVariant := gui.BadgeDefault
-			confirmLabel := "确定安装"
+			workshopLabel := "未检测"
+			workshopVariant := gui.BadgeDefault
+			if st.WorkshopInstalled {
+				workshopLabel = "已订阅"
+				workshopVariant = gui.BadgeSuccess
+			}
+
+			localLabel := "未安装"
+			localVariant := gui.BadgeDefault
+			confirmLabel := "本地安装"
+			confirmVariant := gui.ButtonPrimary
 			if st.Err != "" {
-				statusLabel = "目录异常"
-				statusVariant = gui.BadgeError
+				localLabel = "目录异常"
+				localVariant = gui.BadgeError
 			} else if st.UpToDate {
-				statusLabel = "已安装最新"
-				statusVariant = gui.BadgeSuccess
+				localLabel = "已装最新"
+				localVariant = gui.BadgeSuccess
 				confirmLabel = "重新安装"
 			} else if st.Installed {
-				statusLabel = "检测到旧版"
-				statusVariant = gui.BadgeWarning
-				confirmLabel = "确定更新"
+				localLabel = "有更新"
+				localVariant = gui.BadgeWarning
+				confirmLabel = "更新"
+			}
+			if st.WorkshopInstalled {
+				confirmVariant = gui.ButtonSecondary
+				if !st.Installed && st.Err == "" {
+					confirmLabel = "本地安装"
+				}
 			}
 
 			targetText := st.InstallDir
@@ -498,13 +517,90 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 				targetText = st.Err
 			}
 
-			bodyItems := []gui.View{
-				gui.Text(gui.TextCfg{
-					Text:      "Civ6SyncFix v1.3（DX11 / DX12 全支持）：修复 64 位哈希碰撞卡顿、局内重载隔回合死循环、后期 AI 重排巨作严重卡顿、国家奇观被抢打断、原版宗教 AI 未初始化不同步，并内置全对象字段级不同步诊断日志。",
-					TextStyle: t.TextStyleBody,
-					Mode:      gui.TextModeWrap,
-					Sizing:    gui.FillFit,
+			workshopItems := []gui.View{
+				gui.Row(gui.ContainerCfg{
+					Sizing:     gui.FillFit,
+					Padding:    gui.NoPadding,
+					SizeBorder: gui.NoBorder,
+					Spacing:    gui.SpacingSmall,
+					VAlign:     gui.VAlignMiddle,
+					Content: []gui.View{
+						gui.Text(gui.TextCfg{
+							Text:      "Steam 创意工坊",
+							TextStyle: t.TextStyleLabel,
+							Sizing:    gui.FillFit,
+						}),
+						gui.Badge(gui.BadgeCfg{
+							Label:   workshopLabel,
+							Variant: workshopVariant,
+						}),
+					},
 				}),
+				gui.Row(gui.ContainerCfg{
+					Sizing:     gui.FillFit,
+					Padding:    gui.NoPadding,
+					SizeBorder: gui.NoBorder,
+					Spacing:    gui.SpacingSmall,
+					VAlign:     gui.VAlignMiddle,
+					Content: []gui.View{
+						gui.Row(gui.ContainerCfg{
+							ID:           "syncfix-workshop-link",
+							Focusable:    true,
+							ClickOnEnter: true,
+							ClickOnSpace: true,
+							Sizing:       gui.FillFit,
+							Padding:      gui.NewPadding(2, 4, 2, 0),
+							SizeBorder:   gui.NoBorder,
+							Hover: gui.HoverStyle{
+								Cursor: gui.CursorPointingHand,
+							},
+							OnClick: func(ctx gui.EventCtx) {
+								ctx.Consume()
+								gui.State[clientApp](ctx.Window).openWorkshopURL(ctx.Window)
+							},
+							Content: []gui.View{
+								gui.Text(gui.TextCfg{
+									Text:      syncFixWorkshopURL,
+									TextStyle: t.TextStyleLink,
+									Mode:      gui.TextModeWrap,
+									Sizing:    gui.FillFit,
+								}),
+							},
+						}),
+						gui.Button(gui.ButtonCfg{
+							ID:      "syncfix-copy-workshop",
+							Label:   "复制",
+							Variant: gui.ButtonGhost,
+							OnClick: func(ctx gui.EventCtx) {
+								ctx.Consume()
+								ctx.Window.SetClipboard(syncFixWorkshopURL)
+							},
+						}),
+						gui.Button(gui.ButtonCfg{
+							ID:      "syncfix-open-workshop",
+							Label:   "打开工坊",
+							Variant: gui.ButtonPrimary,
+							OnClick: func(ctx gui.EventCtx) {
+								ctx.Consume()
+								gui.State[clientApp](ctx.Window).openWorkshopURL(ctx.Window)
+							},
+						}),
+					},
+				}),
+			}
+			if st.WorkshopInstalled {
+				workshopItems = append(workshopItems,
+					gui.Text(gui.TextCfg{
+						Text:      st.WorkshopDir,
+						TextStyle: t.TextStyleCodeSmall,
+						Mode:      gui.TextModeWrap,
+						Sizing:    gui.FillFit,
+					}),
+				)
+			}
+
+			bodyItems := []gui.View{
+				subtlePanelView("syncfix-workshop-info", gui.FillFit, workshopItems...),
 				subtlePanelView("syncfix-dialog-info", gui.FillFit,
 					gui.Row(gui.ContainerCfg{
 						Sizing:     gui.FillFit,
@@ -514,19 +610,15 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 						VAlign:     gui.VAlignMiddle,
 						Content: []gui.View{
 							gui.Text(gui.TextCfg{
-								Text:      "安装状态",
+								Text:      "本地安装",
 								TextStyle: t.TextStyleLabel,
 								Sizing:    gui.FillFit,
 							}),
 							gui.Badge(gui.BadgeCfg{
-								Label:   statusLabel,
-								Variant: statusVariant,
+								Label:   localLabel,
+								Variant: localVariant,
 							}),
 						},
-					}),
-					gui.Text(gui.TextCfg{
-						Text:      "目标路径",
-						TextStyle: t.TextStyleCaption,
 					}),
 					gui.Text(gui.TextCfg{
 						Text:      targetText,
@@ -535,17 +627,20 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 						Sizing:    gui.FillFit,
 					}),
 				),
-				gui.Text(gui.TextCfg{
-					Text:      "安装后请在 Steam 创意工坊取消订阅旧版 FastSync 与 DX12 独立内核修复（3823991616），并在游戏「额外内容 › 模组」勾选「Civ6SyncFix」即可。",
-					TextStyle: t.TextStyleSecondary,
+			}
+
+			if st.WorkshopInstalled && st.Installed {
+				bodyItems = append(bodyItems, gui.Text(gui.TextCfg{
+					Text:      "工坊与本地版共存，建议卸载本地版。",
+					TextStyle: t.TextStyleWarning,
 					Mode:      gui.TextModeWrap,
 					Sizing:    gui.FillFit,
-				}),
+				}))
 			}
 
 			if app.snap.CivRunning {
 				bodyItems = append(bodyItems, gui.Text(gui.TextCfg{
-					Text:      "提示：当前检测到文明 VI 正在运行，若写入 DLL 提示被占用，请先退出游戏后再点确定。",
+					Text:      "文明 VI 运行中，写入文件可能被占用。",
 					TextStyle: t.TextStyleWarning,
 					Mode:      gui.TextModeWrap,
 					Sizing:    gui.FillFit,
@@ -562,7 +657,7 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 						OnClick: func(ctx gui.EventCtx) {
 							ctx.Consume()
 							a := gui.State[clientApp](ctx.Window)
-							a.openPath(ctx.Window, a.syncFixMod.InstallDir, "Mod 目录已打开")
+							a.openPath(ctx.Window, a.syncFixMod.InstallDir)
 						},
 					}),
 					gui.Button(gui.ButtonCfg{
@@ -584,7 +679,7 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 				}),
 				gui.Button(gui.ButtonCfg{
 					ID:      "syncfix-cancel",
-					Label:   "取消",
+					Label:   "关闭",
 					Variant: gui.ButtonSecondary,
 					OnClick: func(ctx gui.EventCtx) {
 						ctx.Consume()
@@ -594,7 +689,7 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 				gui.Button(gui.ButtonCfg{
 					ID:       "syncfix-confirm-install",
 					Label:    confirmLabel,
-					Variant:  gui.ButtonPrimary,
+					Variant:  confirmVariant,
 					Disabled: st.Err != "",
 					OnClick: func(ctx gui.EventCtx) {
 						ctx.Consume()
@@ -626,50 +721,38 @@ func (a *clientApp) openSyncFixDialog(w *gui.Window) {
 func (a *clientApp) statusMeta() (title, detail string, variant gui.BadgeVariant, accentColor gui.Color) {
 	t := gui.CurrentTheme()
 	if a.closing {
-		return "正在关闭", "正在结束房间会话并释放网络资源…", gui.BadgeWarning, t.Cfg.ColorWarning
+		return "正在关闭", "", gui.BadgeWarning, t.Cfg.ColorWarning
 	}
 	snap := a.snap
 	detail = snap.Detail
 	if first, _, multi := strings.Cut(detail, "\n"); multi {
-		detail = first + "。完整信息见「诊断与日志」。"
+		detail = first
 	}
 	switch snap.State {
 	case stateConnecting:
-		if detail == "" {
-			detail = "正在联系中转服务器…"
-		}
 		return "正在连接", detail, gui.BadgeInfo, t.ColorAccent
 	case stateLeaving:
-		if detail == "" {
-			detail = "正在离开房间…"
-		}
-		return "正在结束会话", detail, gui.BadgeWarning, t.Cfg.ColorWarning
+		return "正在离开", "", gui.BadgeWarning, t.Cfg.ColorWarning
 	case stateFailed:
 		return "连接失败", detail, gui.BadgeError, t.Cfg.ColorError
 	case stateJoined:
 		switch {
 		case snap.Tunnel.Silent:
-			return "中转暂时无响应", "正在继续探测中转。连接恢复后会自动更新。", gui.BadgeError, t.Cfg.ColorError
+			return "中转无响应", "正在重试探测", gui.BadgeError, t.Cfg.ColorError
 		case snap.Capture && !snap.BridgeRunning:
-			return "游戏转发已停止", "请前往「诊断与日志」查看运行日志或运行诊断。", gui.BadgeError, t.Cfg.ColorError
+			return "转发已停止", "请查看诊断与日志", gui.BadgeError, t.Cfg.ColorError
 		case !snap.Capture:
-			return "已进入房间", "隧道测试模式，游戏流量未接入。", gui.BadgeSuccess, t.Cfg.ColorSuccess
+			return "已进入房间", "测试模式（未抓包）", gui.BadgeSuccess, t.Cfg.ColorSuccess
 		default:
 			if snap.PCAPError != "" {
-				detail = "本地 PCAP 记录异常，请查看运行日志。"
+				detail = "PCAP 记录异常"
 			} else if snap.Host && snap.PCAPActive && snap.PCAPPath != "" {
-				detail = fmt.Sprintf("房主端正在记录游戏 UDP（%d 包），自动保留最近 3 天。", snap.PCAPPackets)
+				detail = fmt.Sprintf("PCAP 已写入 %d 包", snap.PCAPPackets)
 			}
-			if detail == "" {
-				detail = "成员上线后，在文明 VI 的「多人游戏 › 局域网」创建或加入游戏。"
-			}
-			return "游戏转发运行中", detail, gui.BadgeSuccess, t.Cfg.ColorSuccess
+			return "运行中", detail, gui.BadgeSuccess, t.Cfg.ColorSuccess
 		}
 	default:
-		if detail == "" {
-			detail = "和朋友使用同一中转地址，再创建房间或输入房间码加入。"
-		}
-		return "尚未连接", detail, gui.BadgeDefault, t.ColorBorder
+		return "未连接", detail, gui.BadgeDefault, t.ColorBorder
 	}
 }
 
@@ -1006,19 +1089,29 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 func (a *clientApp) sidebarSyncFixCard(w *gui.Window) gui.View {
 	t := gui.CurrentTheme()
 	st := a.syncFixMod
-	badgeLabel := "未安装"
+	badgeLabel := "未装"
 	badgeVariant := gui.BadgeDefault
-	btnLabel := "一键安装修复 Mod"
+	btnLabel := "安装 / 订阅"
 	btnVariant := gui.ButtonPrimary
-	if st.UpToDate {
-		badgeLabel = "已安装"
+	if st.WorkshopInstalled && st.Installed {
+		badgeLabel = "工坊+本地"
+		badgeVariant = gui.BadgeWarning
+		btnLabel = "管理 Mod"
+		btnVariant = gui.ButtonSecondary
+	} else if st.WorkshopInstalled {
+		badgeLabel = "已订阅"
 		badgeVariant = gui.BadgeSuccess
-		btnLabel = "同步修复 Mod"
+		btnLabel = "管理 Mod"
+		btnVariant = gui.ButtonSecondary
+	} else if st.UpToDate {
+		badgeLabel = "已装"
+		badgeVariant = gui.BadgeSuccess
+		btnLabel = "管理 Mod"
 		btnVariant = gui.ButtonSecondary
 	} else if st.Installed {
 		badgeLabel = "可更新"
 		badgeVariant = gui.BadgeWarning
-		btnLabel = "更新修复 Mod"
+		btnLabel = "更新 Mod"
 		btnVariant = gui.ButtonPrimary
 	}
 
@@ -1030,7 +1123,7 @@ func (a *clientApp) sidebarSyncFixCard(w *gui.Window) gui.View {
 			VAlign:     gui.VAlignMiddle,
 			Content: []gui.View{
 				gui.Text(gui.TextCfg{
-					Text:      "联机同步修复",
+					Text:      "同步修复 Mod",
 					TextStyle: t.TextStyleCaption,
 					Sizing:    gui.FillFit,
 				}),
@@ -1106,9 +1199,9 @@ func (a *clientApp) footerBarView(w *gui.Window) gui.View {
 	items := []gui.View{
 		metric("延迟", rtt),
 		gui.Separator(gui.SeparatorCfg{Vertical: true, Length: 12}),
-		metric("游戏收/发", traffic),
+		metric("收/发", traffic),
 		gui.Separator(gui.SeparatorCfg{Vertical: true, Length: 12}),
-		metric("本地丢弃", drops),
+		metric("丢弃", drops),
 		gui.Row(gui.ContainerCfg{
 			Sizing:     gui.FillFit,
 			Padding:    gui.NoPadding,

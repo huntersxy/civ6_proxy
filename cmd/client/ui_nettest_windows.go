@@ -30,21 +30,21 @@ type testDisplay struct {
 }
 
 type netTestState struct {
-	mode      testMode
-	relay     string
-	displays  [2]testDisplay
-	playRes   playtest.Result
-	bwRes     speedtest.Result
-	cancel    context.CancelFunc
-	done      chan struct{}
-	stopping  bool
+	mode     testMode
+	relay    string
+	displays [2]testDisplay
+	playRes  playtest.Result
+	bwRes    speedtest.Result
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stopping bool
 }
 
 func (nt *netTestState) init() {
 	nt.mode = playMode
 	nt.displays = [2]testDisplay{
-		{status: "尚未开始联机模拟"},
-		{status: "尚未开始带宽压测"},
+		{status: "未开始"},
+		{status: "未开始"},
 	}
 }
 
@@ -64,8 +64,8 @@ func (nt *netTestState) syncTarget(relayInput string) {
 	if nt.relay != addr && nt.relay != "" {
 		nt.relay = addr
 		nt.displays = [2]testDisplay{
-			{status: "目标中转已变更，可重新开始模拟"},
-			{status: "目标中转已变更，可重新开始压测"},
+			{status: "目标已变更"},
+			{status: "目标已变更"},
 		}
 		nt.playRes = playtest.Result{}
 		nt.bwRes = speedtest.Result{}
@@ -79,15 +79,15 @@ func (nt *netTestState) start(app *clientApp, w *gui.Window) {
 	address, err := app.relayAddressForTest()
 	if err != nil {
 		nt.setDisplay(err.Error(), nt.displays[nt.mode].progress, true)
-		app.toast(w, gui.ToastWarning, "中转地址无效", err.Error())
+		app.toast(w, gui.ToastWarning, "地址无效", err.Error())
 		w.InvalidateLayout()
 		return
 	}
 	if nt.relay != address {
 		nt.relay = address
 		nt.displays = [2]testDisplay{
-			{status: "尚未开始联机模拟"},
-			{status: "尚未开始带宽压测"},
+			{status: "未开始"},
+			{status: "未开始"},
 		}
 		nt.playRes = playtest.Result{}
 		nt.bwRes = speedtest.Result{}
@@ -95,10 +95,10 @@ func (nt *netTestState) start(app *clientApp, w *gui.Window) {
 	mode := nt.mode
 	if mode == playMode {
 		nt.playRes = playtest.Result{}
-		nt.setDisplay("正在创建临时房间…", 0, false)
+		nt.setDisplay("创建房间…", 0, false)
 	} else {
 		nt.bwRes = speedtest.Result{}
-		nt.setDisplay("正在连接中转服…", 0, false)
+		nt.setDisplay("连接中…", 0, false)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,18 +180,18 @@ func (nt *netTestState) updatePlay(result playtest.Result) {
 	var progress float32
 	switch result.Phase {
 	case playtest.Creating:
-		status = "正在创建临时房间…"
+		status = "创建房间…"
 	case playtest.Joining:
-		status = "测试玩家正在入房…"
+		status = "加入房间…"
 	case playtest.Discovering:
-		status = "正在广播发现房间…"
+		status = "房间发现…"
 	case playtest.Playing:
-		status = fmt.Sprintf("正在模拟对局  %.1f / %.0f 秒", result.PhaseElapsed.Seconds(), result.PhaseDuration.Seconds())
+		status = fmt.Sprintf("模拟中  %.1f / %.0f s", result.PhaseElapsed.Seconds(), result.PhaseDuration.Seconds())
 		if result.PhaseDuration > 0 {
 			progress = float32(result.PhaseElapsed.Seconds() / result.PhaseDuration.Seconds())
 		}
 	case playtest.Settling:
-		status = "正在结算在途数据报…"
+		status = "结算中…"
 		progress = 1
 	}
 	nt.setDisplay(status, progress, false)
@@ -199,20 +199,20 @@ func (nt *netTestState) updatePlay(result playtest.Result) {
 
 func (nt *netTestState) finishPlay(app *clientApp, w *gui.Window, result playtest.Result, err error) {
 	nt.playRes = result
-	text := "联机模拟完成"
+	text := "完成"
 	switch {
 	case errors.Is(err, playtest.ErrRoomClosed):
-		text = "临时房间已断开，保留本次结果。"
+		text = "房间已断开"
 	case err != nil && result.Phase == playtest.Creating:
-		text = "无法创建临时房间。请检查中转地址、UDP 端口或运行日志。"
+		text = "创建房间失败"
 	case err != nil && result.Phase == playtest.Joining:
-		text = "临时房间已创建，但测试玩家未能加入。请查看运行日志。"
+		text = "入房失败"
 	case err != nil:
-		text = "联机模拟中断，保留本次结果。"
+		text = "模拟中断"
 	case result.Discovery.Replies == 0:
-		text = "联机模拟完成，未收到房间发现应答。"
+		text = "无房间发现应答"
 	case result.SteadyRTT.Replies+result.SyncRTT.Replies == 0:
-		text = "联机模拟完成，未收到游戏消息应答。"
+		text = "无消息应答"
 	}
 	nt.finish(app, w, text, err)
 }
@@ -228,23 +228,23 @@ func (nt *netTestState) updateBandwidth(result speedtest.Result) {
 	if result.PhaseDuration > 0 {
 		progress = float32(result.Elapsed.Seconds() / result.PhaseDuration.Seconds())
 	}
-	nt.setDisplay(fmt.Sprintf("%s  %.1f / %.1f 秒", phase, result.Elapsed.Seconds(), result.PhaseDuration.Seconds()), progress, false)
+	nt.setDisplay(fmt.Sprintf("%s  %.1f / %.1f s", phase, result.Elapsed.Seconds(), result.PhaseDuration.Seconds()), progress, false)
 }
 
 func (nt *netTestState) finishBandwidth(app *clientApp, w *gui.Window, result speedtest.Result, err error) {
 	nt.bwRes = result
-	text := "压测完成"
+	text := "完成"
 	switch {
 	case errors.Is(err, speedtest.ErrBusy):
-		text = "中转服正在压测或刚刚结束，稍等几秒再试。"
+		text = "服务端正忙"
 	case errors.Is(err, speedtest.ErrUnavailable):
-		text = "中转服尚未启用带宽压测。"
+		text = "服务端未启用压测"
 	case errors.Is(err, speedtest.ErrNoReply):
-		text = "中转服没有响应。请检查地址、UDP 端口和服务端版本。"
+		text = "服务端无响应"
 	case errors.Is(err, speedtest.ErrInterrupted):
-		text = "中转服停止响应，已采集的数据保留在窗口内。"
+		text = "压测中断"
 	case err != nil:
-		text = "压测失败。请查看运行日志。"
+		text = "压测失败"
 	}
 	nt.finish(app, w, text, err)
 }
@@ -258,16 +258,13 @@ func (nt *netTestState) finish(app *clientApp, w *gui.Window, text string, err e
 	stopped := nt.stopping || errors.Is(err, context.Canceled)
 	nt.stopping = false
 	if stopped {
-		text = "已停止，保留本次结果。"
+		text = "已停止"
 	} else if err == nil {
 		progress = 1
 	} else if app.s != nil {
-		app.s.logError("网络测试失败，中转 %s: %v", nt.relay, err)
+		app.s.logError("网络测试失败 (%s): %v", nt.relay, err)
 	}
 	nt.setDisplay(text, progress, err != nil && !stopped)
-	if !stopped && err == nil {
-		app.toast(w, gui.ToastSuccess, text, "测试数据已更新。")
-	}
 }
 
 func latencyText(d time.Duration) string {
@@ -349,15 +346,12 @@ func (a *clientApp) netTestView(w *gui.Window) gui.View {
 		statusStyle = t.TextStyleSuccess.Bold()
 	}
 
-	startLabel, hint := "开始模拟", "同机双端 · 文明 VI 实测流量模型（1180 B 同步突发 + 14 B 高频回执）"
+	startLabel := "开始"
 	if nt.mode == playMode && (nt.playRes.Create > 0 || nt.playRes.Discovery.Attempts > 0) {
-		startLabel = "重新模拟"
+		startLabel = "重测"
 	}
-	if nt.mode == bandwidthMode {
-		startLabel, hint = "开始压测", "压测丢包不代表联机丢包"
-		if nt.bwRes.Download.Sent > 0 || nt.bwRes.Upload.Sent > 0 {
-			startLabel = "重新压测"
-		}
+	if nt.mode == bandwidthMode && (nt.bwRes.Download.Sent > 0 || nt.bwRes.Upload.Sent > 0) {
+		startLabel = "重测"
 	}
 
 	canStart := !running && !a.closing && a.snap.State != stateConnecting && a.snap.State != stateLeaving
@@ -370,22 +364,11 @@ func (a *clientApp) netTestView(w *gui.Window) gui.View {
 			Spacing:    gui.SpacingMedium,
 			VAlign:     gui.VAlignMiddle,
 			Content: []gui.View{
-				gui.Column(gui.ContainerCfg{
-					Sizing:     gui.FillFit,
-					Padding:    gui.NoPadding,
-					SizeBorder: gui.NoBorder,
-					Spacing:    gui.SpacingPx(2),
-					Content: []gui.View{
-						gui.Text(gui.TextCfg{
-							Text:      disp.status,
-							TextStyle: statusStyle,
-							Mode:      gui.TextModeWrap,
-						}),
-						gui.Text(gui.TextCfg{
-							Text:      hint,
-							TextStyle: t.TextStyleCaption,
-						}),
-					},
+				gui.Text(gui.TextCfg{
+					Text:      disp.status,
+					TextStyle: statusStyle,
+					Mode:      gui.TextModeWrap,
+					Sizing:    gui.FillFit,
 				}),
 				gui.Button(gui.ButtonCfg{
 					ID:       "nettest-start",
@@ -623,9 +606,12 @@ func (a *clientApp) bandwidthModeResultsView() gui.View {
 		},
 	)
 
-	capText := "UDP 测速会占用带宽，测试时建议暂停下载或直播。"
+	bwCardItems := []gui.View{latTable}
 	if res.MaxMbps > 0 {
-		capText = fmt.Sprintf("服务端测速上限 %d Mbps", res.MaxMbps)
+		bwCardItems = append(bwCardItems, gui.Text(gui.TextCfg{
+			Text:      fmt.Sprintf("测速上限 %d Mbps", res.MaxMbps),
+			TextStyle: t.TextStyleCaption,
+		}))
 	}
 
 	return gui.Column(gui.ContainerCfg{
@@ -644,10 +630,7 @@ func (a *clientApp) bandwidthModeResultsView() gui.View {
 					transferCard("bw-upload-card", "上行带宽", res.Upload),
 				},
 			}),
-			cardView("bw-latency-card", gui.FillFit,
-				latTable,
-				gui.Text(gui.TextCfg{Text: capText, TextStyle: t.TextStyleCaption}),
-			),
+			cardView("bw-latency-card", gui.FillFit, bwCardItems...),
 		},
 	})
 }

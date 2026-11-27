@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -91,6 +92,30 @@ func openFolder(path string) error {
 		return nil
 	}
 	if err := exec.Command("explorer.exe", cleaned).Start(); err == nil {
+		return nil
+	}
+	if callErr != syscall.Errno(0) {
+		return callErr
+	}
+	return fmt.Errorf("ShellExecuteW returned %d", result)
+}
+
+func openURL(rawURL string) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if !strings.HasPrefix(trimmed, "https://") && !strings.HasPrefix(trimmed, "http://") {
+		return fmt.Errorf("不支持的链接协议: %s", rawURL)
+	}
+	operation, err := syscall.UTF16PtrFromString("open")
+	if err != nil {
+		return err
+	}
+	target, err := syscall.UTF16PtrFromString(trimmed)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := procShellExecuteW.Call(0,
+		uintptr(unsafe.Pointer(operation)), uintptr(unsafe.Pointer(target)), 0, 0, uintptr(swShowNormal))
+	if result > 32 {
 		return nil
 	}
 	if callErr != syscall.Errno(0) {

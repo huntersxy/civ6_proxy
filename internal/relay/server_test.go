@@ -83,24 +83,38 @@ func doHandshake(t testing.TB, s *Server, kind protocol.Kind, req protocol.Hands
 	if len(out) == 0 {
 		return hResult{}
 	}
-	frame, err := protocol.Decode(out[0].Data)
-	if err != nil {
-		t.Fatal(err)
-	}
 	res := hResult{raw: out[0].Data}
-	switch frame.Kind {
-	case protocol.KindWelcome:
-		var w protocol.WelcomeMessage
-		if err := protocol.DecodeControl(frame.Payload, &w); err != nil {
+	reasm := protocol.NewReassembler()
+	for _, o := range out {
+		frame, err := protocol.Decode(o.Data)
+		if err != nil {
 			t.Fatal(err)
 		}
-		res.welcome = &w
-	case protocol.KindError:
-		var e protocol.ErrorMessage
-		if err := protocol.DecodeControl(frame.Payload, &e); err != nil {
-			t.Fatal(err)
+		if len(o.Data) > protocol.MaxOuterDatagram {
+			t.Fatalf("datagram exceeds MaxOuterDatagram: %d", len(o.Data))
 		}
-		res.errMsg = &e
+		switch frame.Kind {
+		case protocol.KindWelcome:
+			payload, err := reasm.Add(&frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if payload != nil {
+				var w protocol.WelcomeMessage
+				if err := protocol.DecodeControl(payload, &w); err != nil {
+					t.Fatal(err)
+				}
+				res.welcome = &w
+				return res
+			}
+		case protocol.KindError:
+			var e protocol.ErrorMessage
+			if err := protocol.DecodeControl(frame.Payload, &e); err != nil {
+				t.Fatal(err)
+			}
+			res.errMsg = &e
+			return res
+		}
 	}
 	return res
 }
@@ -534,53 +548,73 @@ func TestCreateWithAuthFlagRejected(t *testing.T) {
 	}
 }
 
-func TestJoinFitsMaximumRoster(t *testing.T) {
+func TestJoinFitsLargeFragmentedRoster(t *testing.T) {
 	server, _ := newTestServer(t)
-	longName := strings.Repeat("🤝", 19)
+	longName := strings.Repeat("🤝", 24)
 	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
 		RequestID: "00000001", Name: longName,
 	}, addr(1)).welcome
-	for index := 2; index <= 8; index++ {
+	if host == nil || host.MaxMembers != 0 {
+		t.Fatalf("unexpected default host welcome: %+v", host)
+	}
+	for index := 2; index <= 16; index++ {
 		join := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
 			RequestID: fmt.Sprintf("%08x", index), Name: longName, RoomCode: host.RoomCode,
 		}, addr(index))
 		if join.welcome == nil {
 			t.Fatalf("member %d did not fit: %+v", index, join.errMsg)
 		}
-		if len(join.raw) > protocol.MaxOuterDatagram {
-			t.Fatalf("member %d welcome is %d bytes", index, len(join.raw))
-		}
-		if index == 8 && (join.welcome.MemberID != 9 || len(join.welcome.Members) != 8) {
-			t.Fatalf("unexpected full roster: %+v", join.welcome)
+		if index == 16 && (join.welcome.MemberID != 17 || len(join.welcome.Members) != 16) {
+			t.Fatalf("unexpected 16-member roster: %+v", join.welcome)
 		}
 	}
 }
 
-func TestJoinRejectsUnencodableRoster(t *testing.T) {
+func TestCustomMaxMembersLimit(t *testing.T) {
 	server, _ := newTestServer(t)
-	longName := strings.Repeat("🤝", 24)
+	badNeg := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "00000000", Name: "host", MaxMembers: -1,
+	}, addr(1))
+	if badNeg.errMsg == nil || badNeg.errMsg.Code != "invalid_request" {
+		t.Fatalf("expected invalid_request for MaxMembers=-1, got %+v", badNeg)
+	}
+	badHigh := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
+		RequestID: "00000000b", Name: "host", MaxMembers: protocol.MaxRoomMembers + 1,
+	}, addr(1))
+	if badHigh.errMsg == nil || badHigh.errMsg.Code != "invalid_request" {
+		t.Fatalf("expected invalid_request for MaxMembers>%d, got %+v", protocol.MaxRoomMembers, badHigh)
+	}
+
 	host := doHandshake(t, server, protocol.KindCreate, protocol.HandshakeRequest{
-		RequestID: "00000001", Name: longName,
+		RequestID: "00000001", Name: "host", MaxMembers: 3,
 	}, addr(1)).welcome
-	for index := 2; index <= 6; index++ {
-		join := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
-			RequestID: fmt.Sprintf("%08x", index), Name: longName, RoomCode: host.RoomCode,
-		}, addr(index))
-		if join.welcome == nil {
-			t.Fatalf("member %d should fit: %+v", index, join.errMsg)
-		}
+	if host == nil || host.MaxMembers != 3 {
+		t.Fatalf("expected MaxMembers=3, got %+v", host)
 	}
-	overflow := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
-		RequestID: "00000007", Name: longName, RoomCode: host.RoomCode,
-	}, addr(7))
-	if overflow.errMsg == nil || overflow.errMsg.Code != "roster_too_large" {
-		t.Fatalf("expected roster error, got %+v", overflow)
+	m2 := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000002", Name: "p2", RoomCode: host.RoomCode,
+	}, addr(2)).welcome
+	m3 := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000003", Name: "p3", RoomCode: host.RoomCode,
+	}, addr(3)).welcome
+	if m2 == nil || m3 == nil || m3.MaxMembers != 3 {
+		t.Fatalf("expected 2nd and 3rd joins to succeed: m2=%+v m3=%+v", m2, m3)
 	}
-	guest := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
-		RequestID: "00000008", Name: "guest", RoomCode: host.RoomCode,
-	}, addr(7)).welcome
-	if guest == nil || guest.MemberID != 8 || len(guest.Members) != 7 {
-		t.Fatalf("failed join affected the roster: %+v", guest)
+	full := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000004", Name: "p4", RoomCode: host.RoomCode,
+	}, addr(4))
+	if full.errMsg == nil || full.errMsg.Code != "room_full" {
+		t.Fatalf("expected room_full, got %+v", full)
+	}
+
+	// Member 2 leaves, freeing a slot for p4.
+	roomID := parseRoomID(t, host.RoomID)
+	server.Handle(clientFrame(t, tokenOf(t, m2), roomID, m2.MemberID, protocol.KindLeave, 0, 1, nil), addr(2))
+	p4 := doHandshake(t, server, protocol.KindJoin, protocol.HandshakeRequest{
+		RequestID: "00000005", Name: "p4", RoomCode: host.RoomCode,
+	}, addr(4))
+	if p4.welcome == nil || p4.welcome.MemberID != m2.MemberID {
+		t.Fatalf("expected p4 to reuse freed slot %d, got %+v", m2.MemberID, p4)
 	}
 }
 

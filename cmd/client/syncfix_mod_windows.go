@@ -15,20 +15,29 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed civ6syncfix.zip
 var embeddedSyncFixZip []byte
 
-const syncFixModFolderName = "Civ6SyncFix"
+const (
+	syncFixModFolderName = "Civ6SyncFix"
+	civ6SteamAppID       = "289070"
+	syncFixWorkshopID    = "3846151010"
+	syncFixWorkshopURL   = "https://steamcommunity.com/sharedfiles/filedetails/?id=" + syncFixWorkshopID
+)
 
 type syncFixModStatus struct {
-	ModsRoot   string
-	InstallDir string
-	Installed  bool
-	UpToDate   bool
-	FileCount  int
-	Err        string
+	ModsRoot          string
+	InstallDir        string
+	Installed         bool
+	UpToDate          bool
+	FileCount         int
+	WorkshopDir       string
+	WorkshopInstalled bool
+	Err               string
 }
 
 type guid struct {
@@ -83,6 +92,157 @@ func defaultCiv6ModsRoot() (string, error) {
 	return filepath.Join(docs, "My Games", "Sid Meier's Civilization VI", "Mods"), nil
 }
 
+func defaultSteamLibraryRoots() []string {
+	var candidates []string
+	addRoot := func(p string) {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			candidates = append(candidates, filepath.Clean(p))
+		}
+	}
+
+	readRegPath := func(root registry.Key, subkey, valueName string, access uint32) {
+		k, err := registry.OpenKey(root, subkey, access)
+		if err != nil {
+			return
+		}
+		defer k.Close()
+		if val, _, err := k.GetStringValue(valueName); err == nil {
+			addRoot(val)
+		}
+	}
+
+	readRegPath(registry.CURRENT_USER, `Software\Valve\Steam`, "SteamPath", registry.QUERY_VALUE)
+	readRegPath(registry.LOCAL_MACHINE, `SOFTWARE\WOW6432Node\Valve\Steam`, "InstallPath", registry.QUERY_VALUE)
+	readRegPath(registry.LOCAL_MACHINE, `SOFTWARE\Valve\Steam`, "InstallPath", registry.QUERY_VALUE)
+	for _, envName := range []string{"ProgramFiles(x86)", "ProgramFiles"} {
+		if base := strings.TrimSpace(os.Getenv(envName)); base != "" {
+			addRoot(filepath.Join(base, "Steam"))
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var roots []string
+	recordUnique := func(dir string) {
+		cleaned := filepath.Clean(strings.TrimSpace(dir))
+		if cleaned == "" || cleaned == "." {
+			return
+		}
+		key := strings.ToLower(cleaned)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		roots = append(roots, cleaned)
+	}
+
+	for _, steamDir := range candidates {
+		recordUnique(steamDir)
+		for _, vdfRel := range []string{
+			filepath.Join("steamapps", "libraryfolders.vdf"),
+			filepath.Join("config", "libraryfolders.vdf"),
+		} {
+			raw, err := os.ReadFile(filepath.Join(steamDir, vdfRel))
+			if err != nil {
+				continue
+			}
+			for _, libPath := range parseLibraryFoldersVDF(string(raw)) {
+				recordUnique(libPath)
+			}
+		}
+	}
+	return roots
+}
+
+func parseLibraryFoldersVDF(content string) []string {
+	var libs []string
+	var prevToken string
+	expectValue := false
+
+	i := 0
+	for i < len(content) {
+		ch := content[i]
+		if ch == '"' {
+			i++
+			var b strings.Builder
+			for i < len(content) {
+				c := content[i]
+				if c == '\\' && i+1 < len(content) {
+					next := content[i+1]
+					if next == '\\' || next == '"' {
+						b.WriteByte(next)
+						i += 2
+						continue
+					}
+				}
+				if c == '"' {
+					i++
+					break
+				}
+				b.WriteByte(c)
+				i++
+			}
+			tok := b.String()
+			if expectValue {
+				if strings.EqualFold(prevToken, "path") || isAllDigits(prevToken) {
+					if cleaned := filepath.Clean(strings.TrimSpace(tok)); cleaned != "" && cleaned != "." {
+						libs = append(libs, cleaned)
+					}
+				}
+				expectValue = false
+			} else {
+				prevToken = tok
+				expectValue = true
+			}
+			continue
+		}
+		if ch == '{' || ch == '}' {
+			expectValue = false
+			i++
+			continue
+		}
+		if ch == '/' && i+1 < len(content) && content[i+1] == '/' {
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		i++
+	}
+	return libs
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func findWorkshopModDir(libraryRoots []string, appID, itemID string) (string, bool) {
+	for _, root := range libraryRoots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		dir := filepath.Join(filepath.Clean(root), "steamapps", "workshop", "content", appID, itemID)
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) == 0 {
+			continue
+		}
+		return dir, true
+	}
+	return "", false
+}
+
 type embeddedModEntry struct {
 	relPath string
 	data    []byte
@@ -134,10 +294,14 @@ func loadEmbeddedSyncFixEntries() ([]embeddedModEntry, error) {
 	return entries, nil
 }
 
-func inspectSyncFixMod(modsRoot string) syncFixModStatus {
+func inspectSyncFixMod(modsRoot string, libraryRoots []string) syncFixModStatus {
 	st := syncFixModStatus{
 		ModsRoot:   filepath.Clean(modsRoot),
 		InstallDir: filepath.Join(filepath.Clean(modsRoot), syncFixModFolderName),
+	}
+	if workshopDir, ok := findWorkshopModDir(libraryRoots, civ6SteamAppID, syncFixWorkshopID); ok {
+		st.WorkshopDir = workshopDir
+		st.WorkshopInstalled = true
 	}
 	entries, err := loadEmbeddedSyncFixEntries()
 	if err != nil {
@@ -186,7 +350,7 @@ func installSyncFixMod(modsRoot string) (string, error) {
 			return "", fmt.Errorf("写入文件 %s 失败（若文明 VI 正在运行请先退出游戏）: %w", e.relPath, err)
 		}
 	}
-	st := inspectSyncFixMod(modsRoot)
+	st := inspectSyncFixMod(modsRoot, nil)
 	if !st.UpToDate {
 		return "", errors.New("安装后校验失败，文件未完整写入")
 	}

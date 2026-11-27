@@ -103,8 +103,9 @@ type Client struct {
 	decompressor *protocol.Decompressor
 	packetID     uint32
 
-	pendingMu sync.Mutex
-	pending   *pendingHandshake
+	pendingMu            sync.Mutex
+	pending              *pendingHandshake
+	handshakeReassembler *protocol.Reassembler
 
 	handlerMu    sync.RWMutex
 	dataHandler  DataHandler
@@ -119,11 +120,12 @@ type Client struct {
 }
 
 type clientRoom struct {
-	token    []byte
-	roomID   uint64
-	memberID uint8
-	roomCode string
-	isHost   bool
+	token      []byte
+	roomID     uint64
+	memberID   uint8
+	roomCode   string
+	isHost     bool
+	maxMembers int
 
 	txAuth      *protocol.Authenticator
 	rxAuth      *protocol.Authenticator
@@ -177,15 +179,16 @@ func NewContext(ctx context.Context, host string, port int) (*Client, error) {
 	_ = conn.SetReadBuffer(4 << 20)
 	_ = conn.SetWriteBuffer(1 << 20)
 	c := &Client{
-		conn:         conn,
-		relay:        netip.AddrPortFrom(addresses[0].Unmap(), uint16(port)),
-		start:        time.Now(),
-		compressor:   protocol.NewCompressor(),
-		decompressor: protocol.NewDecompressor(),
-		packetID:     randomUint32(),
-		probe:        make(chan struct{}, 1),
-		p2pWake:      make(chan struct{}, 1),
-		stop:         make(chan struct{}),
+		conn:                 conn,
+		relay:                netip.AddrPortFrom(addresses[0].Unmap(), uint16(port)),
+		start:                time.Now(),
+		compressor:           protocol.NewCompressor(),
+		decompressor:         protocol.NewDecompressor(),
+		packetID:             randomUint32(),
+		handshakeReassembler: protocol.NewReassembler(),
+		probe:                make(chan struct{}, 1),
+		p2pWake:              make(chan struct{}, 1),
+		stop:                 make(chan struct{}),
 	}
 	c.wg.Add(2)
 	go c.readLoop()
@@ -237,6 +240,15 @@ func (c *Client) IsHost() bool {
 	return room != nil && room.isHost
 }
 
+// MaxMembers returns the room's configured member limit (0 = unlimited).
+func (c *Client) MaxMembers() int {
+	room := c.room.Load()
+	if room != nil {
+		return room.maxMembers
+	}
+	return 0
+}
+
 // Peers returns a copy of the current member list.
 func (c *Client) Peers() []protocol.Peer {
 	if room := c.room.Load(); room != nil {
@@ -268,15 +280,24 @@ func (c *Client) Metrics() Metrics {
 	return m
 }
 
-// CreateRoom creates a new room and returns the welcome message.
+// CreateRoom creates a new room with unlimited members and returns the welcome message.
 func (c *Client) CreateRoom(name string, timeout time.Duration) (*protocol.WelcomeMessage, error) {
+	return c.CreateRoomMaxMembers(name, 0, timeout)
+}
+
+// CreateRoomMaxMembers creates a new room with an optional member cap (0 = unlimited).
+func (c *Client) CreateRoomMaxMembers(name string, maxMembers int, timeout time.Duration) (*protocol.WelcomeMessage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return c.CreateRoomContext(ctx, name)
+	return c.CreateRoomContextMaxMembers(ctx, name, maxMembers)
 }
 
 func (c *Client) CreateRoomContext(ctx context.Context, name string) (*protocol.WelcomeMessage, error) {
-	return c.handshake(ctx, protocol.KindCreate, protocol.HandshakeRequest{Name: name})
+	return c.CreateRoomContextMaxMembers(ctx, name, 0)
+}
+
+func (c *Client) CreateRoomContextMaxMembers(ctx context.Context, name string, maxMembers int) (*protocol.WelcomeMessage, error) {
+	return c.handshake(ctx, protocol.KindCreate, protocol.HandshakeRequest{Name: name, MaxMembers: maxMembers})
 }
 
 // JoinRoom joins a room by code and returns the welcome message.
@@ -524,13 +545,21 @@ func (c *Client) handleHandshakeResponse(frame *protocol.Frame) {
 		c.finishHandshake(msg.RequestID, handshakeResult{err: &Error{Code: msg.Code, Message: msg.Message}}, nil)
 		return
 	}
+	payload, err := c.handshakeReassembler.Add(frame)
+	if err != nil {
+		c.counter.dropped.Add(1)
+		return
+	}
+	if payload == nil {
+		return
+	}
 	var welcome protocol.WelcomeMessage
-	if err := protocol.DecodeControl(frame.Payload, &welcome); err != nil {
+	if err := protocol.DecodeControl(payload, &welcome); err != nil {
 		c.counter.dropped.Add(1)
 		return
 	}
 	token, err := base64.URLEncoding.DecodeString(welcome.Token)
-	if err != nil || len(token) != 32 || welcome.MemberID < 2 || welcome.MemberID > 9 {
+	if err != nil || len(token) != 32 || welcome.MemberID < protocol.FirstMemberID || welcome.MemberID > protocol.LastMemberID {
 		c.counter.dropped.Add(1)
 		return
 	}
@@ -540,7 +569,8 @@ func (c *Client) handleHandshakeResponse(frame *protocol.Frame) {
 		return
 	}
 	room := &clientRoom{
-		token: token, roomID: roomID, memberID: welcome.MemberID, roomCode: welcome.RoomCode, isHost: welcome.Host,
+		token: token, roomID: roomID, memberID: welcome.MemberID, roomCode: welcome.RoomCode,
+		isHost: welcome.Host, maxMembers: welcome.MaxMembers,
 		txAuth: protocol.NewAuthenticator(token), rxAuth: protocol.NewAuthenticator(token),
 		seq: protocol.NewCounter(), reassembler: protocol.NewReassembler(),
 	}
@@ -585,11 +615,19 @@ func (c *Client) handleAuthenticated(frame *protocol.Frame, raw []byte) {
 	room.lastRx.Store(time.Since(c.start).Nanoseconds())
 	switch frame.Kind {
 	case protocol.KindPeers:
+		payload, err := room.reassembler.Add(frame)
+		if err != nil {
+			c.counter.dropped.Add(1)
+			return
+		}
+		if payload == nil {
+			return
+		}
 		if frame.Sequence < room.peerSeq {
 			return
 		}
 		var msg protocol.PeerListMessage
-		if err := protocol.DecodeControl(frame.Payload, &msg); err != nil {
+		if err := protocol.DecodeControl(payload, &msg); err != nil {
 			c.counter.dropped.Add(1)
 			return
 		}
@@ -662,7 +700,15 @@ func (c *Client) handleAuthenticated(frame *protocol.Frame, raw []byte) {
 		c.room.Store(nil)
 		c.emit(Event{Type: EventRoomClosed, Reason: msg.Reason})
 	case protocol.KindP2PState:
-		c.handleP2PState(room, frame)
+		payload, err := room.reassembler.Add(frame)
+		if err != nil {
+			c.counter.dropped.Add(1)
+			return
+		}
+		if payload == nil {
+			return
+		}
+		c.handleP2PState(room, frame, payload)
 	case protocol.KindData:
 		c.deliverGameData(room, frame)
 	}

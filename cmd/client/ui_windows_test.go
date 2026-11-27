@@ -33,6 +33,7 @@ func newTestClientWindow(t *testing.T, dark bool) (*gui.Window, *clientApp) {
 	app := newClientApp(nil, cfg)
 	testModsRoot := filepath.Join(t.TempDir(), "Mods")
 	app.modsRootFn = func() (string, error) { return testModsRoot, nil }
+	app.workshopRootsFn = func() []string { return nil }
 	app.refreshSyncFixStatus()
 	app.logEntries = []logEntry{
 		{Time: "22:00:01", Level: "INFO", Message: "Civ6RelayClient 启动"},
@@ -480,6 +481,65 @@ func TestSyncFixModDialogInstallAndUninstall(t *testing.T) {
 	w.TestRender(nil)
 	if app.syncFixMod.Installed {
 		t.Fatalf("expected syncFixMod uninstalled, got %+v", app.syncFixMod)
+	}
+}
+
+func TestSyncFixWorkshopLinkAndDetectionInUI(t *testing.T) {
+	w, app := newTestClientWindow(t, false)
+	var copied string
+	var openedURL string
+	w.SetClipboardFn(func(s string) { copied = s })
+	app.openURLFn = func(u string) error {
+		openedURL = u
+		return nil
+	}
+
+	steamLib := t.TempDir()
+	workshopDir := filepath.Join(steamLib, "steamapps", "workshop", "content", civ6SteamAppID, syncFixWorkshopID)
+	if err := os.MkdirAll(workshopDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workshopDir, "Civ6SyncFix.modinfo"), []byte("<Mod/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app.workshopRootsFn = func() []string { return []string{steamLib} }
+
+	btns := w.ResolveID("sidebar-syncfix-btn")
+	if len(btns) != 1 {
+		t.Fatalf("expected 1 sidebar-syncfix-btn, got %v", btns)
+	}
+	if err := w.TestClick(btns[0]); err != nil {
+		t.Fatalf("click sidebar-syncfix-btn: %v", err)
+	}
+	w.TestRender(nil)
+
+	if !app.syncFixMod.WorkshopInstalled || app.syncFixMod.WorkshopDir != workshopDir {
+		t.Fatalf("expected WorkshopInstalled=true, got %+v", app.syncFixMod)
+	}
+	if dups := w.TestDuplicateIDs(); len(dups) != 0 {
+		t.Fatalf("syncfix workshop dialog duplicate IDs: %v", dups)
+	}
+
+	copyBtns := w.ResolveID("syncfix-copy-workshop")
+	if len(copyBtns) != 1 {
+		t.Fatalf("expected 1 syncfix-copy-workshop, got %v", copyBtns)
+	}
+	if err := w.TestClick(copyBtns[0]); err != nil {
+		t.Fatalf("click syncfix-copy-workshop: %v", err)
+	}
+	if copied != syncFixWorkshopURL {
+		t.Fatalf("expected copied URL %q, got %q", syncFixWorkshopURL, copied)
+	}
+
+	openBtns := w.ResolveID("syncfix-open-workshop")
+	if len(openBtns) != 1 {
+		t.Fatalf("expected 1 syncfix-open-workshop, got %v", openBtns)
+	}
+	if err := w.TestClick(openBtns[0]); err != nil {
+		t.Fatalf("click syncfix-open-workshop: %v", err)
+	}
+	if openedURL != syncFixWorkshopURL {
+		t.Fatalf("expected opened URL %q, got %q", syncFixWorkshopURL, openedURL)
 	}
 }
 

@@ -18,8 +18,8 @@ import (
 const (
 	discoveryPortMin   = 62900
 	discoveryPortMax   = 62999
-	firstVirtualMember = 2
-	lastVirtualMember  = 9
+	firstVirtualMember = protocol.FirstMemberID
+	lastVirtualMember  = protocol.LastMemberID
 	injectionQueueSize = 1024
 )
 
@@ -107,7 +107,6 @@ func StartBridge(client *tunnel.Client, subnet *net.IPNet, route RouteInfo, driv
 	go b.recvLoop(game, false)
 	go b.recvLoop(discovery, true)
 	go b.injectLoop()
-	logf("info", fmt.Sprintf("WinDivert 已启动，虚拟网段 %s", subnet))
 	return b, nil
 }
 

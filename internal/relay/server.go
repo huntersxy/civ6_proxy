@@ -76,8 +76,8 @@ type handshakeKey struct {
 }
 
 type cachedHandshake struct {
-	expires float64
-	data    []byte
+	expires   float64
+	datagrams [][]byte
 }
 
 type handshakeLimit struct {

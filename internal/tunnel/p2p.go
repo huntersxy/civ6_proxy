@@ -20,7 +20,7 @@ const (
 	p2pRelayPreferMargin   = 15 * time.Millisecond
 	p2pDirectRestoreMargin = 5 * time.Millisecond
 	p2pProbeHistory        = 8
-	maxMemberID            = 9
+	maxMemberID            = protocol.LastMemberID
 )
 
 type PeerPath uint8
@@ -172,14 +172,14 @@ func (state *p2pRoom) updatePathPreference(memberID uint8) {
 	}
 }
 
-func validMember(id uint8) bool { return id >= 2 && id <= maxMemberID }
+func validMember(id uint8) bool { return id >= protocol.FirstMemberID && id <= maxMemberID }
 
-func (c *Client) handleP2PState(room *clientRoom, frame *protocol.Frame) {
-	if frame.SourceMember != 0 || frame.FragmentCount != 1 {
+func (c *Client) handleP2PState(room *clientRoom, frame *protocol.Frame, payload []byte) {
+	if frame.SourceMember != 0 {
 		return
 	}
 	var reply protocol.P2PState
-	if protocol.DecodeControl(frame.Payload, &reply) != nil || reply.Request == 0 || len(reply.Peers) > maxMemberID-2 ||
+	if protocol.DecodeControl(payload, &reply) != nil || reply.Request == 0 || len(reply.Peers) > protocol.MaxRoomMembers-1 ||
 		(len(reply.Challenge) != 0 && len(reply.Challenge) != protocol.P2PProofSize) {
 		return
 	}
@@ -326,7 +326,7 @@ func (c *Client) stepRelayProbes(room *clientRoom, state *p2pRoom, now time.Time
 	}
 }
 
-const firstProbeMemberID = 2
+const firstProbeMemberID = protocol.FirstMemberID
 
 func (c *Client) writePeerFrame(room *clientRoom, path *p2pPath, frame *protocol.Frame) bool {
 	frame.RoomID = room.roomID

@@ -84,8 +84,9 @@ func TestDriverExtractAndLoad(t *testing.T) {
 			discovery bool
 		}{
 			{VirtualMemberIP(subnet, 2), 62056, true, false},
-			{VirtualMemberIP(subnet, 9), 62056, true, false},
-			{VirtualMemberIP(subnet, 10), 62056, false, false},
+			{VirtualMemberIP(subnet, 254), 62056, true, false},
+			{VirtualMemberIP(subnet, 1), 62056, false, false},
+			{VirtualMemberIP(subnet, 255), 62056, false, false},
 			{net.IPv4bcast, 62900, false, true},
 			{net.IPv4bcast, 62999, false, true},
 			{net.IPv4bcast, 62056, false, false},

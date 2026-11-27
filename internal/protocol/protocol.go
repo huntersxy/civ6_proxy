@@ -25,6 +25,11 @@ const (
 	MaxFragmentPayload = MaxOuterDatagram - HeaderSize - AuthTagSize
 	MaxFragmentCount   = (MaxUDPPayload + MaxFragmentPayload - 1) / MaxFragmentPayload
 	ReassemblyTimeout  = 2 * time.Second
+
+	FirstMemberID   uint8 = 2
+	LastMemberID    uint8 = 254
+	BroadcastMember uint8 = 255
+	MaxRoomMembers        = int(LastMemberID - FirstMemberID + 1)
 )
 
 // Kind is a frame kind.

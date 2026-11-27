@@ -8,9 +8,8 @@ import (
 )
 
 const (
-	maxRoomMembers   = 8
-	firstMemberID    = 2
-	broadcastMember  = 255
+	firstMemberID    = protocol.FirstMemberID
+	broadcastMember  = protocol.BroadcastMember
 	offlineAfterSec  = 30.0
 	retentionSec     = 60.0
 	handshakeTTLSec  = 10.0
@@ -90,16 +89,64 @@ func newMember(id uint8, name string, token [32]byte, addr netip.AddrPort, host 
 }
 
 type room struct {
-	mu      sync.Mutex
-	id      uint64
-	code    string
-	members [maxRoomMembers]*member
-	closed  bool
-	p2pSeed [protocol.P2PKeySize]byte
+	mu         sync.Mutex
+	id         uint64
+	code       string
+	maxMembers int
+	members    []*member
+	closed     bool
+	controlSeq uint32
+	p2pSeed    [protocol.P2PKeySize]byte
+}
+
+func (r *room) effectiveLimit() int {
+	if r.maxMembers > 0 && r.maxMembers < protocol.MaxRoomMembers {
+		return r.maxMembers
+	}
+	return protocol.MaxRoomMembers
+}
+
+func (r *room) nextPacketID() uint32 {
+	r.controlSeq++
+	if r.controlSeq == 0 {
+		r.controlSeq++
+	}
+	return r.controlSeq
+}
+
+func (r *room) appendControl(m *member, addr netip.AddrPort, kind protocol.Kind, payload []byte, signed bool, batch *Batch) bool {
+	chunks, err := protocol.SplitPayload(payload)
+	if err != nil {
+		return false
+	}
+	packetID := r.nextPacketID()
+	var flags protocol.Flags
+	if len(chunks) > 1 {
+		flags |= protocol.FlagFragmented
+	}
+	for index, chunk := range chunks {
+		frame := protocol.Frame{
+			Kind:          kind,
+			Flags:         flags,
+			RoomID:        r.id,
+			SourceMember:  0,
+			TargetMember:  m.id,
+			FragmentIndex: uint16(index),
+			FragmentCount: uint16(len(chunks)),
+			PacketID:      packetID,
+			Payload:       chunk,
+		}
+		if signed {
+			batch.appendSignedTo(m, addr, frame)
+		} else if !batch.appendFrame(addr, frame, nil) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *room) member(id uint8) *member {
-	slot := int(id) - firstMemberID
+	slot := int(id) - int(firstMemberID)
 	if slot < 0 || slot >= len(r.members) {
 		return nil
 	}
@@ -112,7 +159,11 @@ func (r *room) nextSlot() int {
 			return slot
 		}
 	}
-	return -1
+	if len(r.members) >= r.effectiveLimit() {
+		return -1
+	}
+	r.members = append(r.members, nil)
+	return len(r.members) - 1
 }
 
 func (r *room) peerList() []protocol.Peer {

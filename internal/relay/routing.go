@@ -57,7 +57,7 @@ func (s *Server) handleAuthenticated(r *room, frame *protocol.Frame, addr netip.
 		if m.isHost {
 			s.closeRoomLocked(r, "host_left", batch)
 		} else {
-			r.members[m.id-firstMemberID] = nil
+			r.members[int(m.id)-int(firstMemberID)] = nil
 			s.memberCount.Add(-1)
 			s.peerUpdatesLocked(r, batch)
 			s.log.Printf("member left room=%s member=%d", r.code, m.id)
@@ -73,7 +73,7 @@ func (s *Server) handleAuthenticated(r *room, frame *protocol.Frame, addr netip.
 
 func (r *room) routePathProbeLocked(sender *member, frame *protocol.Frame, now float64, batch *Batch) {
 	if frame.FragmentCount != 1 || frame.Flags&protocol.FlagBroadcast != 0 || len(frame.Payload) != 8 ||
-		frame.TargetMember < firstMemberID || frame.TargetMember > firstMemberID+maxRoomMembers-1 ||
+		frame.TargetMember < protocol.FirstMemberID || frame.TargetMember > protocol.LastMemberID ||
 		frame.TargetMember == sender.id || !sender.pathLimit.allow(len(frame.Payload), now) {
 		return
 	}
@@ -109,9 +109,30 @@ func (s *Server) peerUpdatesLocked(r *room, batch *Batch) {
 	if err != nil {
 		return
 	}
-	frame := protocol.Frame{Kind: protocol.KindPeers, RoomID: r.id, Payload: payload}
+	chunks, err := protocol.SplitPayload(payload)
+	if err != nil {
+		return
+	}
+	packetID := r.nextPacketID()
+	var flags protocol.Flags
+	if len(chunks) > 1 {
+		flags |= protocol.FlagFragmented
+	}
 	for _, m := range r.members {
-		if m != nil && m.online {
+		if m == nil || !m.online {
+			continue
+		}
+		for index, chunk := range chunks {
+			frame := protocol.Frame{
+				Kind:          protocol.KindPeers,
+				Flags:         flags,
+				RoomID:        r.id,
+				TargetMember:  m.id,
+				FragmentIndex: uint16(index),
+				FragmentCount: uint16(len(chunks)),
+				PacketID:      packetID,
+				Payload:       chunk,
+			}
 			batch.appendSigned(m, frame)
 		}
 	}

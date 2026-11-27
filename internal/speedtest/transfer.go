@@ -47,7 +47,7 @@ func (progress *sendProgress) setRTT(rtt time.Duration) {
 	}
 	for {
 		prev := progress.rtt.Load()
-		next := ((prev >> 32) + 1)<<32 | ms
+		next := ((prev>>32)+1)<<32 | ms
 		if progress.rtt.CompareAndSwap(prev, next) {
 			return
 		}

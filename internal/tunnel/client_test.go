@@ -236,6 +236,74 @@ func TestCancelledHandshakeIgnoresWelcome(t *testing.T) {
 	}
 }
 
+func TestTunnelCustomMaxMembersAndLargeRoster(t *testing.T) {
+	hostAddr, port, stopRelay := startTestRelay(t)
+	defer stopRelay()
+
+	// 1. Custom limit = 2.
+	host1, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host1.Disconnect()
+	w1, err := host1.CreateRoomMaxMembers("host1", 2, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w1.MaxMembers != 2 || host1.MaxMembers() != 2 {
+		t.Fatalf("expected MaxMembers=2, got welcome=%d client=%d", w1.MaxMembers, host1.MaxMembers())
+	}
+	g1, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g1.Disconnect()
+	if _, err := g1.JoinRoom(w1.RoomCode, "g1", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Disconnect()
+	_, err = g2.JoinRoom(w1.RoomCode, "g2", 3*time.Second)
+	var te *Error
+	if !errors.As(err, &te) || te.Code != "room_full" {
+		t.Fatalf("expected room_full for 3rd member, got %v", err)
+	}
+
+	// 2. Default unlimited (0): 12 members with long names (triggers fragmented WELCOME & PEERS).
+	host2, err := New(hostAddr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host2.Disconnect()
+	longPrefix := "玩家一二三四五六七八九十甲乙丙丁戊己庚辛"
+	w2, err := host2.CreateRoom(longPrefix+"01", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w2.MaxMembers != 0 || host2.MaxMembers() != 0 {
+		t.Fatalf("expected default MaxMembers=0, got %d/%d", w2.MaxMembers, host2.MaxMembers())
+	}
+	for i := 2; i <= 12; i++ {
+		c, err := New(hostAddr, port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Disconnect()
+		name := longPrefix + string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
+		wj, err := c.JoinRoom(w2.RoomCode, name, 3*time.Second)
+		if err != nil {
+			t.Fatalf("member %d join failed: %v", i, err)
+		}
+		if len(wj.Members) != i {
+			t.Fatalf("member %d saw %d peers", i, len(wj.Members))
+		}
+	}
+	waitFor(t, "host2 sees all 12 peers", func() bool { return len(host2.Peers()) == 12 })
+}
+
 func TestTunnelCompressionReducesWireBytes(t *testing.T) {
 	hostAddr, port, stopRelay := startTestRelay(t)
 	defer stopRelay()
