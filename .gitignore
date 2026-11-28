@@ -7,3 +7,4 @@ mod/Civ6SyncFix/tools/
 *.out
 .idea/
 .vscode/
+/promo
