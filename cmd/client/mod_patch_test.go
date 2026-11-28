@@ -395,3 +395,49 @@ func TestAIDiagPromptButtonCopiesPaths(t *testing.T) {
 		t.Fatalf("unconsumed events: %v", unconsumed)
 	}
 }
+
+func TestLaunchCiv6Button(t *testing.T) {
+	if err := openURL(civ6LaunchSteamURI); err != nil {
+		t.Fatalf("expected openURL(steam://) to be no-op under go test, got %v", err)
+	}
+
+	steamLib := t.TempDir()
+	civExe := filepath.Join(steamLib, "steamapps", "common", "Sid Meier's Civilization VI", "Base", "Binaries", "Win64Steam", "CivilizationVI_DX12.exe")
+	if err := os.MkdirAll(filepath.Dir(civExe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(civExe, []byte("exe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := findCiv6LaunchExe([]string{steamLib}); got != civExe {
+		t.Fatalf("findCiv6LaunchExe = %q, want %q", got, civExe)
+	}
+
+	w, app := newTestClientWindow(t, false)
+	var launchedURI string
+	app.openURLFn = func(u string) error {
+		launchedURI = u
+		return nil
+	}
+
+	btns := w.ResolveID("sidebar-launch-civ6")
+	if len(btns) != 1 {
+		t.Fatalf("expected 1 sidebar-launch-civ6 button, got %v", btns)
+	}
+	if err := w.TestClick(btns[0]); err != nil {
+		t.Fatalf("click sidebar-launch-civ6: %v", err)
+	}
+	w.TestRender(nil)
+	if launchedURI != civ6LaunchSteamURI {
+		t.Fatalf("expected %q, got %q", civ6LaunchSteamURI, launchedURI)
+	}
+
+	app.snap.CivRunning = true
+	w.TestRender(nil)
+	if dups := w.TestDuplicateIDs(); len(dups) != 0 {
+		t.Fatalf("duplicate IDs with CivRunning=true: %v", dups)
+	}
+	if unconsumed := w.TestUnconsumedEvents(); len(unconsumed) != 0 {
+		t.Fatalf("unconsumed events: %v", unconsumed)
+	}
+}

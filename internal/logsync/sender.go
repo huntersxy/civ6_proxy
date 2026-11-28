@@ -346,6 +346,9 @@ func (g *GuestController) pollAndPump(st *guestState) {
 	}
 	if len(st.pending) < maxPendingChunks {
 		st.watcher.Poll(func(ch FileChunk) bool {
+			if ch.DropPending {
+				st.pending = dropPendingForPath(st.pending, ch.RelPath)
+			}
 			if len(st.pending) >= maxPendingChunks {
 				return false
 			}
@@ -355,6 +358,20 @@ func (g *GuestController) pollAndPump(st *guestState) {
 	}
 	g.pumpWindow(st, time.Now())
 	g.publishStatus(st)
+}
+
+func dropPendingForPath(pending []FileChunk, relPath string) []FileChunk {
+	if len(pending) == 0 {
+		return pending
+	}
+	out := pending[:0]
+	for _, item := range pending {
+		if item.RelPath == relPath {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (g *GuestController) stepTimers(st *guestState) {

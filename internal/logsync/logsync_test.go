@@ -573,6 +573,482 @@ func TestMemberWriterSecurityAndQuota(t *testing.T) {
 	}
 }
 
+func TestWatcherDormantOldBigFileThenTruncatedToSmall(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "net_message_debug.log")
+	oldContent := bytes.Repeat([]byte("OLD-SESSION-LINE-0123456789abcdef\n"), 8000) // ~272 KiB
+	if err := os.WriteFile(logPath, oldContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionStart := time.Now()
+	oldTime := sessionStart.Add(-30 * time.Minute)
+	_ = os.Chtimes(logPath, oldTime, oldTime)
+
+	now := sessionStart
+	w := NewWatcher(WatcherConfig{
+		DiscoverInterval: time.Second,
+		Now:              func() time.Time { return now },
+		DiscoverFilesForSession: func(start time.Time) []SourceSpec {
+			return []SourceSpec{{
+				RelPath:         "civ6_logs/net_message_debug.log",
+				FullPath:        logPath,
+				SkipIfOlderThan: start.Add(-5 * time.Second),
+				InitialMaxBytes: 16 << 10,
+				SegmentMaxBytes: 64 << 10,
+			}}
+		},
+	})
+
+	hostDir := filepath.Join(t.TempDir(), "member")
+	mw, err := newMemberWriter(hostDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	// Pre-session large log stays dormant: 0 bytes sent across multiple polls.
+	var emitted []FileChunk
+	for i := 0; i < 3; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			emitted = append(emitted, ch)
+			return true
+		})
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("expected 0 chunks emitted while dormant, got %d", len(emitted))
+	}
+
+	// Player launches Civ 6: file is first truncated to 0 bytes, then written with small fresh content,
+	// and later overwritten in-place with same-size different content (must capture head fingerprint!).
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	w.Poll(func(ch FileChunk) bool {
+		emitted = append(emitted, ch)
+		if err := mw.WriteChunk(ch, now); err != nil {
+			t.Fatalf("WriteChunk empty: %v", err)
+		}
+		return true
+	})
+
+	freshContent := "[NEW SESSION] Turn 1 GameInit\n[NEW SESSION] Turn 2 SyncOK\n"
+	if err := os.WriteFile(logPath, []byte(freshContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	for i := 0; i < 4; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			emitted = append(emitted, ch)
+			if err := mw.WriteChunk(ch, now); err != nil {
+				t.Fatalf("WriteChunk: %v", err)
+			}
+			return true
+		})
+	}
+	if len(emitted) == 0 {
+		t.Fatal("expected fresh chunks after truncation")
+	}
+	got, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log"))
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+	if string(got) != freshContent {
+		t.Fatalf("synced content = %q, want %q", string(got), freshContent)
+	}
+	// Ensure no wasteful .prev-* artifact was created from the skipped dormant file.
+	matches, _ := filepath.Glob(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log.prev-*"))
+	if len(matches) != 0 {
+		t.Fatalf("expected 0 .prev-* files after waking dormant file, got %v", matches)
+	}
+
+	// Same-size in-place overwrite after 0-byte -> small transition must still trigger head-hash replacement.
+	sameSizeFresh := "[ALT SESSION] Turn 1 GameInit\n[ALT SESSION] Turn 2 SyncOK\n"
+	if len(sameSizeFresh) != len(freshContent) {
+		t.Fatalf("test bug: lengths differ")
+	}
+	if err := os.WriteFile(logPath, []byte(sameSizeFresh), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	for i := 0; i < 4; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			if err := mw.WriteChunk(ch, now); err != nil {
+				t.Fatalf("WriteChunk same-size replace: %v", err)
+			}
+			return true
+		})
+	}
+	got2, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2) != sameSizeFresh {
+		t.Fatalf("same-size replace synced = %q, want %q", string(got2), sameSizeFresh)
+	}
+}
+
+func TestWatcherDormantOldFileThenAppendedOnlySendsDelta(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "Lua.log")
+	oldContent := bytes.Repeat([]byte("OLD-LUA-LINE-1234567890\n"), 3000) // ~72 KiB
+	if err := os.WriteFile(logPath, oldContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionStart := time.Now()
+	oldTime := sessionStart.Add(-15 * time.Minute)
+	_ = os.Chtimes(logPath, oldTime, oldTime)
+
+	w := NewWatcher(WatcherConfig{
+		Now: func() time.Time { return sessionStart },
+		DiscoverFilesForSession: func(start time.Time) []SourceSpec {
+			return []SourceSpec{{
+				RelPath:         "civ6_logs/Lua.log",
+				FullPath:        logPath,
+				SkipIfOlderThan: start.Add(-5 * time.Second),
+				InitialMaxBytes: 16 << 10,
+				SegmentMaxBytes: 64 << 10,
+			}}
+		},
+	})
+
+	hostDir := filepath.Join(t.TempDir(), "member")
+	mw, err := newMemberWriter(hostDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	// Initial poll parks file in dormant state.
+	var totalSent int
+	w.Poll(func(ch FileChunk) bool {
+		totalSent += len(ch.Data)
+		return true
+	})
+	if totalSent != 0 {
+		t.Fatalf("expected 0 bytes while dormant, got %d", totalSent)
+	}
+
+	// Append new line to the same pre-session file without truncating.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const deltaLine = "LIVE-APPEND-TURN-42\n"
+	_, _ = f.WriteString(deltaLine)
+	_ = f.Close()
+
+	for i := 0; i < 4; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			totalSent += len(ch.Data)
+			if err := mw.WriteChunk(ch, sessionStart); err != nil {
+				t.Fatalf("WriteChunk: %v", err)
+			}
+			return true
+		})
+	}
+	if totalSent > 1024 {
+		t.Fatalf("expected only banner + delta (<1 KiB), sent %d bytes", totalSent)
+	}
+	got, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "Lua.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "[Civ6Relay] skipped pre-session") || !strings.HasSuffix(string(got), deltaLine) {
+		t.Fatalf("unexpected delta output:\n%s", string(got))
+	}
+}
+
+func TestWatcherActiveLargeFileInitialTailAndRestartToSmall(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "net_message_debug.log")
+	var b strings.Builder
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&b, "Turn %04d sync-line-payload-0123456789abcdef\n", i)
+	}
+	if err := os.WriteFile(logPath, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	w := NewWatcher(WatcherConfig{
+		Now: func() time.Time { return now },
+		DiscoverFiles: func() []SourceSpec {
+			return []SourceSpec{{
+				RelPath:         "civ6_logs/net_message_debug.log",
+				FullPath:        logPath,
+				InitialMaxBytes: 8 << 10,
+				SegmentMaxBytes: 32 << 10,
+			}}
+		},
+	})
+
+	hostDir := filepath.Join(t.TempDir(), "member")
+	mw, err := newMemberWriter(hostDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	for i := 0; i < 10; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			if err := mw.WriteChunk(ch, now); err != nil {
+				t.Fatalf("WriteChunk: %v", err)
+			}
+			return true
+		})
+	}
+
+	got, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.HasPrefix(text, "[Civ6Relay] file was ") {
+		t.Fatalf("expected initial tail banner, got prefix %q", text[:min(len(text), 80)])
+	}
+	if strings.Contains(text, "Turn 0000 ") {
+		t.Fatalf("expected early Turn 0000 to be omitted from initial tail")
+	}
+	if !strings.Contains(text, "Turn 1999 ") {
+		t.Fatalf("expected latest Turn 1999 in initial tail")
+	}
+	// Verify line alignment after the banner line.
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if len(lines) < 3 || !strings.HasPrefix(lines[1], "Turn ") {
+		t.Fatalf("expected line-aligned tail after banner, got line[1]=%q", lines[1])
+	}
+
+	// Now player restarts game -> large file becomes small fresh file; DropPending must be set.
+	const restarted = "Turn 0001 fresh-after-restart\n"
+	if err := os.WriteFile(logPath, []byte(restarted), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var sawDropPending bool
+	now = now.Add(time.Second)
+	for i := 0; i < 4; i++ {
+		w.Poll(func(ch FileChunk) bool {
+			if ch.DropPending {
+				sawDropPending = true
+			}
+			if err := mw.WriteChunk(ch, now); err != nil {
+				t.Fatalf("WriteChunk after restart: %v", err)
+			}
+			return true
+		})
+	}
+	if !sawDropPending {
+		t.Fatal("expected DropPending=true on mid-session file truncation/replacement")
+	}
+	gotAfter, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotAfter) != restarted {
+		t.Fatalf("expected exact restarted content %q, got %q", restarted, string(gotAfter))
+	}
+	prevs, _ := filepath.Glob(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log.prev-*"))
+	if len(prevs) != 1 {
+		t.Fatalf("expected 1 rotated .prev-* preserving active in-session tail, got %v", prevs)
+	}
+}
+
+func TestWatcherSegmentRotationAndPrevPruning(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "net_message_debug.log")
+	if err := os.WriteFile(logPath, []byte("SEGMENT-START\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	w := NewWatcher(WatcherConfig{
+		Now: func() time.Time { return now },
+		DiscoverFiles: func() []SourceSpec {
+			return []SourceSpec{{
+				RelPath:         "civ6_logs/net_message_debug.log",
+				FullPath:        logPath,
+				SegmentMaxBytes: 12 << 10,
+			}}
+		},
+	})
+
+	hostDir := filepath.Join(t.TempDir(), "member")
+	mw, err := newMemberWriter(hostDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	drain := func() {
+		for i := 0; i < 20; i++ {
+			progressed := false
+			w.Poll(func(ch FileChunk) bool {
+				progressed = true
+				if err := mw.WriteChunk(ch, now); err != nil {
+					t.Fatalf("WriteChunk: %v", err)
+				}
+				return true
+			})
+			if !progressed {
+				break
+			}
+		}
+	}
+
+	drain()
+	// Append 4 rounds of ~11 KiB (> 3 segment rotations total).
+	for round := 1; round <= 4; round++ {
+		now = now.Add(2 * time.Second)
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf("ROUND-%d-%s\n", round, strings.Repeat("X", 100))
+		for j := 0; j < 105; j++ {
+			_, _ = f.WriteString(line)
+		}
+		_, _ = fmt.Fprintf(f, "MARKER-END-ROUND-%d\n", round)
+		_ = f.Close()
+		drain()
+	}
+
+	active, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(active), "MARKER-END-ROUND-4") {
+		t.Fatalf("expected active rotated segment to contain final round marker, got len=%d", len(active))
+	}
+	if !strings.Contains(string(active), "[Civ6Relay] log segment rotated;") {
+		t.Fatalf("expected segment rotation banner in active file")
+	}
+
+	prevs, _ := filepath.Glob(filepath.Join(hostDir, "civ6_logs", "net_message_debug.log.prev-*"))
+	if len(prevs) > maxPrevRotationsPerFile {
+		t.Fatalf("expected at most %d kept .prev-* rotations, got %d (%v)", maxPrevRotationsPerFile, len(prevs), prevs)
+	}
+	if mw.liveDiskBytes() >= mw.totalWritten {
+		t.Fatalf("expected liveDiskBytes (%d) < totalWritten (%d) after pruning old rotations", mw.liveDiskBytes(), mw.totalWritten)
+	}
+}
+
+func TestWatcherBurstFastForwardAndRoundRobinFairness(t *testing.T) {
+	dir := t.TempDir()
+	luaPath := filepath.Join(dir, "Lua.log")
+	netPath := filepath.Join(dir, "net_message_debug.log")
+	modPath := filepath.Join(dir, "Modding.log")
+
+	if err := os.WriteFile(luaPath, []byte("lua-init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(netPath, []byte("net-init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(modPath, []byte("mod-init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	w := NewWatcher(WatcherConfig{
+		Now: func() time.Time { return now },
+		DiscoverFiles: func() []SourceSpec {
+			return []SourceSpec{
+				{RelPath: "civ6_logs/Lua.log", FullPath: luaPath, SegmentMaxBytes: 64 << 10, MaxBacklogBytes: 24 << 10, BacklogTailBytes: 6 << 10},
+				{RelPath: "civ6_logs/net_message_debug.log", FullPath: netPath, SegmentMaxBytes: 64 << 10},
+				{RelPath: "civ6_logs/Modding.log", FullPath: modPath, SegmentMaxBytes: 64 << 10},
+			}
+		},
+	})
+
+	hostDir := filepath.Join(t.TempDir(), "member")
+	mw, err := newMemberWriter(hostDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	// Verify Modding.log has higher priority than Lua.log / net_message_debug.log.
+	var firstPaths []string
+	w.Poll(func(ch FileChunk) bool {
+		firstPaths = append(firstPaths, ch.RelPath)
+		if err := mw.WriteChunk(ch, now); err != nil {
+			t.Fatal(err)
+		}
+		return true
+	})
+	if len(firstPaths) < 3 || firstPaths[0] != "civ6_logs/Modding.log" {
+		t.Fatalf("expected Modding.log prioritized first, got order %v", firstPaths)
+	}
+
+	// Simulate sudden 80 KiB Lua spam burst + small critical net_message_debug line.
+	fLua, err := os.OpenFile(luaPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1600; i++ {
+		_, _ = fmt.Fprintf(fLua, "SPAM-LINE-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i)
+	}
+	_, _ = fLua.WriteString("FINAL-LUA-ERROR-LINE\n")
+	_ = fLua.Close()
+
+	fNet, err := os.OpenFile(netPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fNet.WriteString("DESYNC_DELTA_CRITICAL\n")
+	_ = fNet.Close()
+
+	// Enforce tight backpressure (max 2 chunks per poll) to verify round-robin fairness.
+	netSeenAtPoll := -1
+	for poll := 1; poll <= 20; poll++ {
+		accepted := 0
+		w.Poll(func(ch FileChunk) bool {
+			if accepted >= 2 {
+				return false
+			}
+			accepted++
+			if ch.RelPath == "civ6_logs/net_message_debug.log" && strings.Contains(string(ch.Data), "DESYNC_DELTA_CRITICAL") {
+				if netSeenAtPoll < 0 {
+					netSeenAtPoll = poll
+				}
+			}
+			if err := mw.WriteChunk(ch, now); err != nil {
+				t.Fatal(err)
+			}
+			return true
+		})
+	}
+	if netSeenAtPoll < 0 || netSeenAtPoll > 3 {
+		t.Fatalf("expected net_message_debug.log not starved under backpressure (seen at poll %d)", netSeenAtPoll)
+	}
+
+	luaSynced, err := os.ReadFile(filepath.Join(hostDir, "civ6_logs", "Lua.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(luaSynced), "[Civ6Relay] fast-forwarded ") {
+		t.Fatalf("expected burst backlog fast-forward marker in Lua.log")
+	}
+	if !strings.Contains(string(luaSynced), "FINAL-LUA-ERROR-LINE") {
+		t.Fatalf("expected final Lua line after fast-forward")
+	}
+	if strings.Contains(string(luaSynced), "SPAM-LINE-0001-") {
+		t.Fatalf("expected early spam lines to have been skipped by fast-forward")
+	}
+}
+
+func TestDropPendingForPath(t *testing.T) {
+	in := []FileChunk{
+		{RelPath: "civ6_logs/a.log", Offset: 0},
+		{RelPath: "civ6_logs/b.log", Offset: 0},
+		{RelPath: "civ6_logs/a.log", Offset: 4096},
+	}
+	got := dropPendingForPath(in, "civ6_logs/a.log")
+	if len(got) != 1 || got[0].RelPath != "civ6_logs/b.log" {
+		t.Fatalf("dropPendingForPath kept %+v, want only b.log", got)
+	}
+}
+
 func filesEqual(a, b string) bool {
 	da, err := os.ReadFile(a)
 	if err != nil {

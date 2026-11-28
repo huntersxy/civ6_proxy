@@ -429,6 +429,8 @@ func (a *clientApp) refreshSyncFixStatus() {
 	a.syncFixMod = inspectSyncFixMod(modRoot, roots)
 }
 
+const civ6LaunchSteamURI = "steam://rungameid/" + civ6SteamAppID
+
 func (a *clientApp) openWorkshopURL(w *gui.Window) {
 	openFn := openURL
 	if a.openURLFn != nil {
@@ -437,6 +439,35 @@ func (a *clientApp) openWorkshopURL(w *gui.Window) {
 	if err := openFn(syncFixWorkshopURL); err != nil {
 		a.toast(w, gui.ToastError, "打开失败", err.Error())
 	}
+}
+
+func (a *clientApp) launchCiv6(w *gui.Window) {
+	if a.closing {
+		return
+	}
+	if a.snap.CivRunning {
+		a.toast(w, gui.ToastInfo, "游戏已在运行", "检测到文明 VI 进程正在运行中")
+		return
+	}
+	openFn := openURL
+	if a.openURLFn != nil {
+		openFn = a.openURLFn
+	}
+	err := openFn(civ6LaunchSteamURI)
+	if err != nil && a.openURLFn == nil {
+		err = launchCiv6Executable(a.steamLibraryRoots())
+	}
+	if err != nil {
+		if a.s != nil {
+			a.s.logError("启动文明 VI 失败: %v", err)
+		}
+		a.toast(w, gui.ToastError, "启动游戏失败", err.Error())
+		return
+	}
+	if a.s != nil {
+		a.s.logInfo("已发送启动文明 VI 请求")
+	}
+	a.toast(w, gui.ToastSuccess, "正在启动文明 VI", "已唤起 Steam 启动游戏，请等待游戏窗口打开")
 }
 
 func (a *clientApp) openPath(w *gui.Window, dir string) {
@@ -1162,6 +1193,27 @@ func (a *clientApp) sidebarView(w *gui.Window) gui.View {
 				}),
 			},
 		}),
+		func() gui.View {
+			launchLabel := "启动游戏"
+			launchVariant := gui.ButtonPrimary
+			launchDisabled := a.closing
+			if a.snap.CivRunning {
+				launchLabel = "游戏运行中"
+				launchVariant = gui.ButtonSecondary
+				launchDisabled = true
+			}
+			return gui.Button(gui.ButtonCfg{
+				ID:       "sidebar-launch-civ6",
+				Label:    launchLabel,
+				Variant:  launchVariant,
+				Disabled: launchDisabled,
+				Sizing:   gui.FillFit,
+				OnClick: func(ctx gui.EventCtx) {
+					ctx.Consume()
+					gui.State[clientApp](ctx.Window).launchCiv6(ctx.Window)
+				},
+			})
+		}(),
 	)
 
 	return gui.Column(gui.ContainerCfg{

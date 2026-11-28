@@ -109,7 +109,9 @@ func openURL(rawURL string) error {
 		return nil
 	}
 	trimmed := strings.TrimSpace(rawURL)
-	if !strings.HasPrefix(trimmed, "https://") && !strings.HasPrefix(trimmed, "http://") {
+	if !strings.HasPrefix(trimmed, "https://") &&
+		!strings.HasPrefix(trimmed, "http://") &&
+		!strings.HasPrefix(trimmed, "steam://") {
 		return fmt.Errorf("不支持的链接协议: %s", rawURL)
 	}
 	operation, err := syscall.UTF16PtrFromString("open")
@@ -129,6 +131,44 @@ func openURL(rawURL string) error {
 		return callErr
 	}
 	return fmt.Errorf("ShellExecuteW returned %d", result)
+}
+
+func findCiv6LaunchExe(libraryRoots []string) string {
+	relCandidates := []string{
+		filepath.Join("steamapps", "common", "Sid Meier's Civilization VI", "LaunchPad", "LaunchPad.exe"),
+		filepath.Join("steamapps", "common", "Sid Meier's Civilization VI", "Base", "Binaries", "Win64Steam", "CivilizationVI_DX12.exe"),
+		filepath.Join("steamapps", "common", "Sid Meier's Civilization VI", "Base", "Binaries", "Win64Steam", "CivilizationVI.exe"),
+	}
+	for _, root := range libraryRoots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		cleanedRoot := filepath.Clean(root)
+		for _, rel := range relCandidates {
+			p := filepath.Join(cleanedRoot, rel)
+			if info, err := os.Stat(p); err == nil && !info.IsDir() {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func launchCiv6Executable(libraryRoots []string) error {
+	if testing.Testing() {
+		return nil
+	}
+	exePath := findCiv6LaunchExe(libraryRoots)
+	if exePath == "" {
+		return fmt.Errorf("未找到 Steam 协议处理器或本地 CivilizationVI.exe，请先打开 Steam")
+	}
+	cmd := exec.Command(exePath)
+	cmd.Dir = filepath.Dir(exePath)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func utf16WithNULs(s string) []uint16 {

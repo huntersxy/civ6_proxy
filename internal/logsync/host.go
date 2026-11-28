@@ -21,6 +21,7 @@ const (
 	maxProbeAttempts         = 3
 	hostRecvWindow           = 32
 	idleHandleTTL            = 30 * time.Second
+	maxPrevRotationsPerFile  = 2
 )
 
 // PeerSyncStatus summarizes one teammate's log collection state.
@@ -80,11 +81,17 @@ type streamHandle struct {
 	size             uint64
 }
 
+type prevRotation struct {
+	path string
+	size uint64
+}
+
 type memberWriter struct {
 	dir          string
 	streams      map[string]*streamHandle
 	temps        map[string]*os.File
 	files        map[string]uint64
+	prevFiles    map[string][]prevRotation
 	totalWritten uint64
 	lastUpdated  time.Time
 	lastErr      error
@@ -95,11 +102,25 @@ func newMemberWriter(dir string) (*memberWriter, error) {
 		return nil, err
 	}
 	return &memberWriter{
-		dir:     dir,
-		streams: make(map[string]*streamHandle),
-		temps:   make(map[string]*os.File),
-		files:   make(map[string]uint64),
+		dir:       dir,
+		streams:   make(map[string]*streamHandle),
+		temps:     make(map[string]*os.File),
+		files:     make(map[string]uint64),
+		prevFiles: make(map[string][]prevRotation),
 	}, nil
+}
+
+func (mw *memberWriter) liveDiskBytes() uint64 {
+	var total uint64
+	for _, sz := range mw.files {
+		total += sz
+	}
+	for _, list := range mw.prevFiles {
+		for _, prev := range list {
+			total += prev.size
+		}
+	}
+	return total
 }
 
 func (mw *memberWriter) WriteChunk(ch FileChunk, now time.Time) error {
@@ -110,9 +131,6 @@ func (mw *memberWriter) WriteChunk(ch FileChunk, now time.Time) error {
 	endOff := ch.Offset + uint64(len(ch.Data))
 	if endOff > MaxFileSizeBytes {
 		return fmt.Errorf("%s exceeds max file size", rel)
-	}
-	if mw.totalWritten+uint64(len(ch.Data)) > MaxMemberBytes {
-		return fmt.Errorf("member log quota exceeded (%s)", FormatByteSize(MaxMemberBytes))
 	}
 	targetPath := filepath.Join(mw.dir, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
@@ -127,6 +145,13 @@ func (mw *memberWriter) WriteChunk(ch FileChunk, now time.Time) error {
 }
 
 func (mw *memberWriter) writeSnapshotChunk(rel, targetPath string, ch FileChunk, now time.Time) error {
+	endOff := ch.Offset + uint64(len(ch.Data))
+	curSize := mw.files[rel]
+	if endOff > curSize && mw.liveDiskBytes()+(endOff-curSize) > MaxMemberBytes {
+		err := fmt.Errorf("member log quota exceeded (%s)", FormatByteSize(MaxMemberBytes))
+		mw.lastErr = err
+		return err
+	}
 	tmpPath := targetPath + ".tmp"
 	if ch.Flags&ChunkFlagReset != 0 {
 		if old := mw.temps[rel]; old != nil {
@@ -173,7 +198,7 @@ func (mw *memberWriter) writeSnapshotChunk(rel, targetPath string, ch FileChunk,
 			mw.lastErr = err
 			return err
 		}
-		mw.files[rel] = ch.Offset + uint64(len(ch.Data))
+		mw.files[rel] = endOff
 		mw.lastUpdated = now
 	}
 	return nil
@@ -192,7 +217,17 @@ func (mw *memberWriter) writeStreamChunk(rel, targetPath string, ch FileChunk, n
 		}
 		if sh.writtenInSession {
 			if info, err := os.Stat(targetPath); err == nil && info.Size() > 0 {
-				rotatePrevFile(targetPath, now)
+				if dst := rotatePrevFile(targetPath, now); dst != "" {
+					mw.prevFiles[rel] = append(mw.prevFiles[rel], prevRotation{
+						path: dst,
+						size: uint64(info.Size()),
+					})
+					for len(mw.prevFiles[rel]) > maxPrevRotationsPerFile {
+						oldest := mw.prevFiles[rel][0]
+						_ = os.Remove(oldest.path)
+						mw.prevFiles[rel] = mw.prevFiles[rel][1:]
+					}
+				}
 			}
 		}
 		f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -203,6 +238,7 @@ func (mw *memberWriter) writeStreamChunk(rel, targetPath string, ch FileChunk, n
 		sh.file = f
 		sh.size = 0
 		sh.writtenInSession = false
+		mw.files[rel] = 0
 	} else if sh.file == nil {
 		f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
@@ -210,6 +246,15 @@ func (mw *memberWriter) writeStreamChunk(rel, targetPath string, ch FileChunk, n
 			return err
 		}
 		sh.file = f
+	}
+	endOff := ch.Offset + uint64(len(ch.Data))
+	if endOff > sh.size {
+		delta := endOff - sh.size
+		if mw.liveDiskBytes()+delta > MaxMemberBytes {
+			err := fmt.Errorf("member log quota exceeded (%s)", FormatByteSize(MaxMemberBytes))
+			mw.lastErr = err
+			return err
+		}
 	}
 	if len(ch.Data) > 0 {
 		if _, err := sh.file.WriteAt(ch.Data, int64(ch.Offset)); err != nil {
@@ -219,8 +264,8 @@ func (mw *memberWriter) writeStreamChunk(rel, targetPath string, ch FileChunk, n
 		sh.writtenInSession = true
 		mw.totalWritten += uint64(len(ch.Data))
 	}
-	if end := ch.Offset + uint64(len(ch.Data)); end > sh.size || ch.Flags&ChunkFlagReset != 0 {
-		sh.size = end
+	if endOff > sh.size || ch.Flags&ChunkFlagReset != 0 {
+		sh.size = endOff
 	}
 	sh.lastUsed = now
 	mw.files[rel] = sh.size
@@ -228,7 +273,7 @@ func (mw *memberWriter) writeStreamChunk(rel, targetPath string, ch FileChunk, n
 	return nil
 }
 
-func rotatePrevFile(targetPath string, now time.Time) {
+func rotatePrevFile(targetPath string, now time.Time) string {
 	stamp := now.Format("150405")
 	for suffix := 0; suffix < 100; suffix++ {
 		dst := fmt.Sprintf("%s.prev-%s", targetPath, stamp)
@@ -236,10 +281,13 @@ func rotatePrevFile(targetPath string, now time.Time) {
 			dst = fmt.Sprintf("%s.prev-%s-%02d", targetPath, stamp, suffix)
 		}
 		if _, err := os.Stat(dst); errors.Is(err, fs.ErrNotExist) {
-			_ = os.Rename(targetPath, dst)
-			return
+			if err := os.Rename(targetPath, dst); err == nil {
+				return dst
+			}
+			return ""
 		}
 	}
+	return ""
 }
 
 func (mw *memberWriter) closeIdle(now time.Time) {

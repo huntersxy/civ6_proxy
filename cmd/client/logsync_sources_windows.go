@@ -19,9 +19,22 @@ import (
 
 const (
 	legacyDX12SyncFixWorkshopID = "3823991616"
-	maxCiv6LogCollectBytes      = 50 << 20
+	civ6InitialTailBytes        = 8 << 20  // tail latest 8 MiB if active log is already huge at sync start
+	civ6SegmentMaxBytes         = 32 << 20 // rotate remote segment every 32 MiB during marathon games
+	civ6MaxBacklogBytes         = 16 << 20 // fast-forward if unread burst backlog exceeds 16 MiB
+	civ6BacklogTailBytes        = 4 << 20  // retain latest 4 MiB after a burst fast-forward
+	relayLogInitialTailBytes    = 512 << 10
+	relayLogSegmentMaxBytes     = 16 << 20
+	relayLogMaxBacklogBytes     = 4 << 20
+	relayLogBacklogTailBytes    = 512 << 10
 	maxTotalPCAPCollectBytes    = 30 << 20
+	sessionCutoffGrace          = 5 * time.Second
+	pcapSessionGrace            = 30 * time.Second
+	relayLogActiveGrace         = 5 * time.Minute
+	relayLogLookback            = 24 * time.Hour
 )
+
+var civ6StartTimeFn = win.FindCiv6EarliestStartTime
 
 var fixedCiv6LogNames = []string{
 	"Civ6SyncFix.log",
@@ -74,29 +87,55 @@ func localIdentity(memberName string) (computer, user, displayName string) {
 	return
 }
 
-// buildLocalWatcherConfig creates a WatcherConfig matching the exact file set
-// and env_check.txt diagnostics collected by collect_teammate_logs.bat.
+// buildLocalWatcherConfig creates a WatcherConfig with session-aware filtering,
+// dormant pre-session tracking, large-file tailing, and segment rotation.
 func buildLocalWatcherConfig() logsync.WatcherConfig {
 	return logsync.WatcherConfig{
-		DiscoverFiles: discoverLocalLogSources,
-		GenerateEnv:   generateLocalEnvCheck,
+		DiscoverFilesForSession: discoverLocalLogSourcesForSession,
+		GenerateEnv:             generateLocalEnvCheck,
 	}
 }
 
-func discoverLocalLogSources() []logsync.SourceSpec {
+func discoverLocalLogSourcesForSession(sessionStart time.Time) []logsync.SourceSpec {
+	if sessionStart.IsZero() {
+		sessionStart = time.Now()
+	}
 	civLogs, relayLogs, relayCaptures, relayRoaming, diagReport := localLogPaths()
 	var specs []logsync.SourceSpec
 
-	// 1. Civ 6 logs (fixed targets + dynamic Sync|Desync|C6SE < 50MB)
+	// Determine freshness cutoff for Civ 6 logs:
+	// - Game not running yet -> park pre-session files dormant (0 bytes sent) until Civ 6 writes/truncates them.
+	// - Game already running -> sync files touched since Civ 6 started (keeps earlier Modding.log of this game)
+	//   while keeping untouched leftovers from older sessions dormant.
+	civStart, civRunning := civ6StartTimeFn()
+	civ6Cutoff := sessionStart.Add(-sessionCutoffGrace)
+	if civRunning {
+		if !civStart.IsZero() {
+			civ6Cutoff = civStart.Add(-sessionCutoffGrace)
+		} else {
+			civ6Cutoff = time.Time{}
+		}
+	}
+
+	makeCiv6Spec := func(name string) logsync.SourceSpec {
+		return logsync.SourceSpec{
+			RelPath:          "civ6_logs/" + name,
+			FullPath:         filepath.Join(civLogs, name),
+			SkipIfOlderThan:  civ6Cutoff,
+			InitialMaxBytes:  civ6InitialTailBytes,
+			SegmentMaxBytes:  civ6SegmentMaxBytes,
+			MaxBacklogBytes:  civ6MaxBacklogBytes,
+			BacklogTailBytes: civ6BacklogTailBytes,
+		}
+	}
+
+	// 1. Civ 6 logs (fixed targets + dynamic Sync|Desync|C6SE; large files are tracked too so
+	// they stay dormant if stale, tail cleanly if active, and reset immediately if rewritten smaller).
 	seenCiv := make(map[string]struct{}, len(fixedCiv6LogNames)+8)
 	for _, name := range fixedCiv6LogNames {
 		lower := strings.ToLower(name)
 		seenCiv[lower] = struct{}{}
-		specs = append(specs, logsync.SourceSpec{
-			RelPath:  "civ6_logs/" + name,
-			FullPath: filepath.Join(civLogs, name),
-			MaxBytes: maxCiv6LogCollectBytes,
-		})
+		specs = append(specs, makeCiv6Spec(name))
 	}
 	if entries, err := os.ReadDir(civLogs); err == nil {
 		for _, entry := range entries {
@@ -112,27 +151,37 @@ func discoverLocalLogSources() []logsync.SourceSpec {
 				continue
 			}
 			info, err := entry.Info()
-			if err != nil || !info.Mode().IsRegular() || info.Size() >= maxCiv6LogCollectBytes {
+			if err != nil || !info.Mode().IsRegular() {
 				continue
 			}
 			seenCiv[lower] = struct{}{}
-			specs = append(specs, logsync.SourceSpec{
-				RelPath:  "civ6_logs/" + name,
-				FullPath: filepath.Join(civLogs, name),
-				MaxBytes: maxCiv6LogCollectBytes,
-			})
+			specs = append(specs, makeCiv6Spec(name))
 		}
 	}
 
-	// 2. Civ6Relay logs (recent 4 client-*.log*) + diag report + config.json
-	for _, fi := range recentMatchingFiles(relayLogs, func(name string) bool {
+	// 2. Civ6Relay logs: only current/recent (within 24h, up to 2 files); active file tails last 512 KiB,
+	// older inactive files stay dormant unless written during this session.
+	relayCutoff := sessionStart.Add(-relayLogLookback)
+	relayActiveCutoff := sessionStart.Add(-relayLogActiveGrace)
+	for idx, fi := range recentMatchingFiles(relayLogs, func(name string) bool {
 		lower := strings.ToLower(name)
 		return strings.HasPrefix(lower, "client-") && strings.Contains(lower, ".log")
-	}, 4) {
+	}, 2) {
+		if fi.modTime.Before(relayCutoff) {
+			continue
+		}
+		skipOlder := relayActiveCutoff
+		if idx == 0 && !fi.modTime.Before(relayActiveCutoff) {
+			skipOlder = time.Time{}
+		}
 		specs = append(specs, logsync.SourceSpec{
-			RelPath:  "relay_logs/" + fi.name,
-			FullPath: fi.fullPath,
-			MaxBytes: maxCiv6LogCollectBytes,
+			RelPath:          "relay_logs/" + fi.name,
+			FullPath:         fi.fullPath,
+			SkipIfOlderThan:  skipOlder,
+			InitialMaxBytes:  relayLogInitialTailBytes,
+			SegmentMaxBytes:  relayLogSegmentMaxBytes,
+			MaxBacklogBytes:  relayLogMaxBacklogBytes,
+			BacklogTailBytes: relayLogBacklogTailBytes,
 		})
 	}
 	specs = append(specs,
@@ -148,11 +197,15 @@ func discoverLocalLogSources() []logsync.SourceSpec {
 		},
 	)
 
-	// 3. Recent small PCAP captures (up to 2 files, <= 30MB total)
+	// 3. Current-session PCAP captures only (modified on or after sessionStart - 30s, <= 30 MiB total).
+	pcapCutoff := sessionStart.Add(-pcapSessionGrace)
 	var pcapTotal int64
 	for _, fi := range recentMatchingFiles(relayCaptures, func(name string) bool {
 		return strings.EqualFold(filepath.Ext(name), ".pcap")
 	}, 2) {
+		if fi.modTime.Before(pcapCutoff) {
+			continue
+		}
 		if pcapTotal+fi.size > maxTotalPCAPCollectBytes {
 			continue
 		}

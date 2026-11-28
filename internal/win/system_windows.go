@@ -516,6 +516,35 @@ func FindCiv6Processes() []Process {
 	return out
 }
 
+// FindCiv6EarliestStartTime reports whether any Civilization VI process is
+// currently running and, when accessible via GetProcessTimes, returns the
+// earliest CreationTime among them.
+func FindCiv6EarliestStartTime() (time.Time, bool) {
+	const processQueryLimitedInformation = 0x1000
+	procs := FindCiv6Processes()
+	if len(procs) == 0 {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	for _, p := range procs {
+		h, err := syscall.OpenProcess(processQueryLimitedInformation, false, p.PID)
+		if err != nil {
+			continue
+		}
+		var creation, exit, kernel, user syscall.Filetime
+		err = syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user)
+		_ = syscall.CloseHandle(h)
+		if err != nil {
+			continue
+		}
+		ct := time.Unix(0, creation.Nanoseconds())
+		if earliest.IsZero() || ct.Before(earliest) {
+			earliest = ct
+		}
+	}
+	return earliest, true
+}
+
 // FindRelevantProcesses lists running Civilization and Civ6Relay processes.
 func FindRelevantProcesses() []Process {
 	var out []Process
